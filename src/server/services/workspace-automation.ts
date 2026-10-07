@@ -8,7 +8,7 @@ import { withPlatform, withTenant, type Tx } from '../db';
 import { safeLookup, validateUrl } from '../enrichment/fetch';
 import { AppError, notFound } from '../errors';
 import { logger } from '../logger';
-import { redis } from '../redis';
+import { incr } from '../kv';
 
 /**
  * Workspace automation (Settings → Automation), stored on the organization's settings:
@@ -74,7 +74,7 @@ export async function autoAssign(orgId: string, clientLeadIds: string[]) {
         if (rule && canOwn.includes(rule.ownerId)) owner = rule.ownerId;
       }
       if (!owner && (a.autoAssign.mode === 'round_robin' || a.autoAssign.fallback) && pool.length) {
-        const n = await redis().incr(`rr:${orgId}`).catch(() => assigned + 1);
+        const n = await incr(`rr:${orgId}`).catch(() => assigned + 1);
         owner = pool[(n - 1) % pool.length];
       }
       if (!owner) continue;
@@ -152,7 +152,7 @@ export async function deliverWebhook(deliveryId: string) {
     error = (err as Error).message.slice(0, 300);
   }
   await withPlatform((tx) => tx.webhookDelivery.update({ where: { id: d.id }, data: { attempts: { increment: 1 }, responseCode: code || null, error, status: error ? 'FAILED' : 'DELIVERED', deliveredAt: error ? null : new Date() } }));
-  if (error) throw new Error(`Webhook ${d.id} failed: ${error}`); // BullMQ retries with backoff
+  if (error) throw new Error(`Webhook ${d.id} failed: ${error}`); // the worker retries with backoff
 }
 
 export async function listWebhookDeliveries(ctx: AuthContext, page = 1) {

@@ -20,9 +20,9 @@ import { lookupRegistry, registryConfigured, type Registry } from '../enrichment
 import { webResearch, webResearchAvailable } from '../enrichment/web-research';
 import { wikidataLookup } from '../enrichment/wikidata';
 import { AppError, notFound } from '../errors';
-import { enqueue, queue } from '../jobs/queues';
+import { enqueue, enqueueBulk } from '../jobs/queues';
 import { logger } from '../logger';
-import { redis } from '../redis';
+import { claim, del as kvDel } from '../kv';
 import { getSetting } from '../settings';
 import { resolveLeadSelection } from './leads';
 import { SENIORITY_KEYWORDS } from './marketplace';
@@ -189,8 +189,8 @@ export async function crawlDomain(domain: string, opts: { force?: boolean } = {}
   const cached = await pdb.domainSnapshot.findUnique({ where: { domain } });
   if (cached && !opts.force && Date.now() - cached.fetchedAt.getTime() < SNAPSHOT_TTL_MS) return cached as unknown as Snapshot;
   const lockKey = `enrich:crawl:${domain}`;
-  const locked = await redis().set(lockKey, '1', 'EX', 90, 'NX').catch(() => 'OK');
-  if (locked !== 'OK') {
+  const locked = await claim(lockKey, 90).catch(() => true);
+  if (!locked) {
     for (let i = 0; i < 30; i++) {
       await sleep(1500);
       const s = await pdb.domainSnapshot.findUnique({ where: { domain } });
@@ -206,7 +206,7 @@ export async function crawlDomain(domain: string, opts: { force?: boolean } = {}
     });
     return row as unknown as Snapshot;
   } finally {
-    await redis().del(lockKey).catch(() => null);
+    await kvDel(lockKey).catch(() => null);
   }
 }
 
@@ -617,9 +617,8 @@ export async function queueEnrichment(ctx: AuthContext, input: z.infer<typeof bu
   if (process.env.NODE_ENV === 'test' && process.env.INLINE_JOBS === '1') {
     for (const l of leads) await enrichLead(l.id, { apply: input.apply, force: input.force, actorId: ctx.user.id, batchId });
   } else {
-    const q = queue('enrichment');
     for (let i = 0; i < leads.length; i += 500) {
-      await q.addBulk(leads.slice(i, i + 500).map((l) => ({ name: 'lead', data: { leadId: l.id, apply: input.apply ?? null, force: input.force, actorId: ctx.user.id, batchId }, opts: { jobId: `enrich-${l.id}-${batchId}`, attempts: 2 } })));
+      await enqueueBulk('enrichment', leads.slice(i, i + 500).map((l) => ({ name: 'lead', data: { leadId: l.id, apply: input.apply ?? null, force: input.force, actorId: ctx.user.id, batchId }, opts: { jobId: `enrich-${l.id}-${batchId}`, attempts: 2 } })));
     }
   }
   return { batchId, queued: leads.length, skipped: ids.length - leads.length };
@@ -634,7 +633,7 @@ export async function enrichImport(importId: string) {
   const batchId = `imp_${importId.slice(-8)}`;
   await pdb.leadEnrichment.createMany({ data: leads.map((l) => ({ leadId: l.id, status: 'QUEUED' as const, batchId, applyMode: policy.applyMode })), skipDuplicates: true });
   for (let i = 0; i < leads.length; i += 500) {
-    await queue('enrichment').addBulk(leads.slice(i, i + 500).map((l) => ({ name: 'lead', data: { leadId: l.id, apply: null, force: false, actorId: l.createdById, batchId }, opts: { jobId: `enrich-${l.id}-${batchId}`, attempts: 2 } })));
+    await enqueueBulk('enrichment', leads.slice(i, i + 500).map((l) => ({ name: 'lead', data: { leadId: l.id, apply: null, force: false, actorId: l.createdById, batchId }, opts: { jobId: `enrich-${l.id}-${batchId}`, attempts: 2 } })));
   }
   return { queued: leads.length };
 }

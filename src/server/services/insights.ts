@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import type { AuthContext } from '../auth/context';
 import { withPlatform } from '../db';
-import { redis } from '../redis';
+import { claim } from '../kv';
 import { getCreditSettings } from './credits';
 import { getPricing, MARKET_AVAILABLE } from './marketplace';
 import type { Condition, Filter } from '@/lib/filters';
@@ -118,8 +118,8 @@ export async function logMarketSearch(ctx: AuthContext, filter: Filter, results:
   try {
     if (ctx.scope !== 'ORGANIZATION' || !ctx.orgId || !filter.conditions.length) return;
     const key = `msearch:${ctx.user.id}:${createHash('sha1').update(JSON.stringify(filter.conditions)).digest('hex').slice(0, 16)}`;
-    const fresh = await redis().set(key, '1', 'EX', 3600, 'NX').catch(() => 'OK');
-    if (fresh !== 'OK') return;
+    const fresh = await claim(key, 3600).catch(() => true);
+    if (!fresh) return;
     const cs = filter.conditions;
     await withPlatform((tx) => tx.marketSearchLog.create({
       data: {

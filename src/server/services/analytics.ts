@@ -1,8 +1,7 @@
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { prisma, withPlatform, withTenant, type Tx } from '../db';
-import { queue, QUEUE_NAMES } from '../jobs/queues';
-import { redis } from '../redis';
+import { lastHeartbeat, queueCounts, QUEUE_NAMES } from '../jobs/queues';
 
 /**
  * Analytics. Every figure is computed from database records at request time.
@@ -66,20 +65,13 @@ export async function systemHealth() {
   }
   let queues: { name: string; waiting: number; active: number; failed: number; delayed: number }[] = [];
   try {
-    const t = Date.now();
-    await redis().ping();
-    checks.push({ name: 'Redis', ok: true, detail: `${Date.now() - t} ms` });
-    const hb = await redis().get('worker:heartbeat');
-    const age = hb ? (Date.now() - new Date(hb).getTime()) / 1000 : null;
+    const hb = await lastHeartbeat(process.env.WORKER_SERVICE_NAME ?? 'leads-crm-worker');
+    const age = hb ? (Date.now() - hb.getTime()) / 1000 : null;
     checks.push({ name: 'Background worker', ok: age !== null && age < 90, detail: age === null ? 'No heartbeat — start it with `npm run worker`' : `Heartbeat ${Math.round(age)}s ago` });
-    queues = await Promise.all(
-      QUEUE_NAMES.map(async (name) => {
-        const c = await queue(name).getJobCounts('waiting', 'active', 'failed', 'delayed');
-        return { name, waiting: c.waiting ?? 0, active: c.active ?? 0, failed: c.failed ?? 0, delayed: c.delayed ?? 0 };
-      }),
-    );
+    const counts = await queueCounts();
+    queues = QUEUE_NAMES.map((name) => ({ name, waiting: counts[name].waiting, active: counts[name].active, failed: counts[name].failed, delayed: counts[name].delayed }));
   } catch (e) {
-    checks.push({ name: 'Redis', ok: false, detail: (e as Error).message.slice(0, 120) });
+    checks.push({ name: 'Job queue', ok: false, detail: (e as Error).message.slice(0, 120) });
   }
   checks.push({ name: 'Email delivery', ok: Boolean(process.env.SMTP_URL), detail: process.env.SMTP_URL ? 'SMTP configured' : 'Not configured — messages stored in outbox only' });
   return { checks, queues };

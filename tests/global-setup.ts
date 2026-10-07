@@ -1,7 +1,6 @@
 import { execSync } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { PrismaClient } from '@prisma/client';
-import IORedis from 'ioredis';
 import { loadTestEnv } from './load-env';
 
 /**
@@ -18,8 +17,5 @@ export default async function setup() {
   await prisma.$executeRawUnsafe('CREATE SCHEMA public');
   await prisma.$disconnect();
   execSync('npx prisma migrate deploy', { env: process.env, stdio: 'pipe' });
-  const redis = new IORedis(process.env.REDIS_URL!);
-  await redis.flushdb();
-  await redis.quit();
   rmSync('./storage-test', { recursive: true, force: true });
 }

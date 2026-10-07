@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 
-/** Loads .env, then points the app at the dedicated test database and Redis DB 15. */
+/** Loads .env, then points the app at the dedicated test database. */
 export function loadTestEnv() {
   try {
     for (const line of readFileSync('.env', 'utf8').split('\n')) {
@@ -10,7 +10,6 @@ export function loadTestEnv() {
   } catch {}
   if (!process.env.TEST_DATABASE_URL) throw new Error('TEST_DATABASE_URL is required to run tests');
   process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
-  process.env.REDIS_URL = 'redis://localhost:6379/15';
   process.env.INLINE_JOBS = '1';
   process.env.APP_URL = 'http://localhost:3100';
   process.env.STORAGE_DIR = './storage-test';

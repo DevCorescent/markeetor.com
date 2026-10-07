@@ -1,4 +1,5 @@
-# Local development stack. `docker compose up -d` starts Postgres + Redis (+ optional app/worker).
+# Local development stack. `docker compose up -d` starts Postgres (+ optional app/worker).
+# The job queue lives in Postgres, so there is no broker to run.
 # The app connects as the non-superuser `leads_app` role so row-level security is enforced.
 services:
   postgres:
@@ -17,21 +18,14 @@ services:
       interval: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
-    ports: ["6379:6379"]
-    volumes: [redisdata:/data]
-
   web:
     profiles: ["app"]
     build: .
     env_file: .env
     environment:
       DATABASE_URL: postgresql://leads_app:${APP_DB_PASSWORD:-change-me-dev-only}@postgres:5432/leads_crm?schema=public
-      REDIS_URL: redis://redis:6379/0
     ports: ["3000:3000"]
-    depends_on: { postgres: { condition: service_healthy }, redis: { condition: service_started } }
+    depends_on: { postgres: { condition: service_healthy } }
     volumes: [storage:/app/storage]
 
   worker:
@@ -41,11 +35,9 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql://leads_app:${APP_DB_PASSWORD:-change-me-dev-only}@postgres:5432/leads_crm?schema=public
-      REDIS_URL: redis://redis:6379/0
-    depends_on: { postgres: { condition: service_healthy }, redis: { condition: service_started } }
+    depends_on: { postgres: { condition: service_healthy } }
     volumes: [storage:/app/storage]
 
 volumes:
   pgdata:
-  redisdata:
   storage:

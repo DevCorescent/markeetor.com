@@ -2398,3 +2398,98 @@ model MarketingTemplate {
 
   @@map("marketing_templates")
 }
+
+// ─────────────────── Background jobs (Postgres-backed queue) ───────────────────
+// Replaces the former Redis/BullMQ queue. Like `users` and `sessions`, these tables
+// hold no tenant-owned rows and are deliberately NOT row-level-security protected:
+// `enqueue()` is called from tenant-scoped request paths that carry no RLS bypass,
+// and no tenant-facing endpoint ever reads them (platform `system.manage` only).
+
+enum JobStatus {
+  PENDING
+  ACTIVE
+  COMPLETED
+  FAILED
+}
+
+/// One unit of background work. Claimed by workers with FOR UPDATE SKIP LOCKED.
+model Job {
+  id          String    @id @default(cuid())
+  queue       String
+  name        String
+  payload     Json      @default("{}")
+  status      JobStatus @default(PENDING)
+  /// Earliest time this job may run; carries the `delay` and retry backoff.
+  runAt       DateTime  @default(now())
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(3)
+  /// Exponential retry base in ms; delay = backoffMs * 2^(attempts-1).
+  backoffMs   Int       @default(5000)
+  /// Idempotency key (the former BullMQ `jobId`). A second enqueue with the same
+  /// key is dropped while the first row still exists.
+  dedupeKey   String?   @unique
+  lockedAt    DateTime?
+  lockedBy    String?
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  startedAt   DateTime?
+  finishedAt  DateTime?
+
+  @@index([status, runAt])
+  @@index([queue, status, runAt])
+  @@index([status, finishedAt])
+  @@map("jobs")
+}
+
+/// Repeatable schedules (the former BullMQ job schedulers). One row per logical timer.
+model JobSchedule {
+  key       String    @id
+  queue     String
+  name      String
+  payload   Json      @default("{}")
+  /// Fixed interval in ms. Mutually exclusive with `cron`.
+  everyMs   Int?
+  /// Five-field cron expression (minute hour day-of-month month day-of-week).
+  cron      String?
+  nextRunAt DateTime  @default(now())
+  lastRunAt DateTime?
+  updatedAt DateTime  @updatedAt
+
+  @@index([nextRunAt])
+  @@map("job_schedules")
+}
+
+/// Fixed-window rate-limit counters. Durable on purpose: several windows run for an
+/// hour and gate security controls (login brute force, password reset) and paid
+/// lead reveals, so they must survive a process restart.
+model RateLimitCounter {
+  key       String   @id
+  count     Int      @default(0)
+  expiresAt DateTime
+
+  @@index([expiresAt])
+  @@map("rate_limit_counters")
+}
+
+/// Liveness for long-running processes (currently the worker).
+model ServiceHeartbeat {
+  name   String   @id
+  seenAt DateTime
+  meta   Json     @default("{}")
+
+  @@map("service_heartbeats")
+}
+
+/// Small TTL key-value store, replacing the former Redis usage that was not a queue:
+/// once-only claims (`SET NX EX`), short-lived secrets (MFA enrollment), and period
+/// counters (daily AI/research quotas, round-robin cursors). Not RLS protected, for the
+/// same reason as the job tables above. Expired rows are swept by the maintenance job.
+model KeyValue {
+  key       String    @id
+  value     String
+  expiresAt DateTime?
+  updatedAt DateTime  @updatedAt
+
+  @@index([expiresAt])
+  @@map("kv_store")
+}

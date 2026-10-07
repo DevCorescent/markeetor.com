@@ -14,7 +14,7 @@ import { useApiQuery } from '@/lib/hooks';
 
 type H = {
   checkedAt: string;
-  services: { database: { ok: boolean; ms: number }; redis: { ok: boolean }; worker: { ok: boolean; lastSeenSeconds: number | null }; ai: { configured: boolean }; smtp: { configured: boolean }; razorpay: { configured: boolean; webhook: boolean } };
+  services: { database: { ok: boolean; ms: number }; worker: { ok: boolean; lastSeenSeconds: number | null }; ai: { configured: boolean }; smtp: { configured: boolean }; razorpay: { configured: boolean; webhook: boolean } };
   queues: { name: string; waiting: number; active: number; delayed: number; failed: number; completed: number; reachable: boolean }[];
   failed: { queue: string; id: string; name: string; attempts: number; reason: string; at: string | null }[];
   last24h: { emails: Record<string, number>; webhooks: Record<string, number>; enrichment: Record<string, number>; payments: Record<string, number>; alerts: number };
@@ -50,9 +50,8 @@ export function SystemView() {
         actions={<Button variant="ghost" onClick={() => refetch()}><RefreshCw className={isFetching ? 'animate-spin' : ''} /> Refresh</Button>} />
       {!h ? <Skeleton className="h-96" /> : (
         <div className="flex flex-col gap-4">
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 xl:grid-cols-6">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 xl:grid-cols-5">
             <Status ok={h.services.database.ok} label="Database" detail={h.services.database.ok ? `${h.services.database.ms} ms` : undefined} />
-            <Status ok={h.services.redis.ok} label="Redis" />
             <Status ok={h.services.worker.ok} label="Worker" detail={h.services.worker.lastSeenSeconds == null ? 'No heartbeat' : `Seen ${h.services.worker.lastSeenSeconds}s ago`} />
             <Status ok={h.services.smtp.configured} optional label="Email (SMTP)" />
             <Status ok={h.services.ai.configured} optional label="AI provider" />

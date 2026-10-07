@@ -5,10 +5,10 @@ import { audit } from '../audit';
 import type { AuthContext } from '../auth/context';
 import { withPlatform } from '../db';
 import { notFound } from '../errors';
-import { queue, QUEUE_NAMES } from '../jobs/queues';
+import { queueCounts, QUEUE_NAMES } from '../jobs/queues';
 import { logger } from '../logger';
 import { sendEmail } from '../mail';
-import { redis } from '../redis';
+import { claim } from '../kv';
 import { clientHealth } from './health';
 import { MARKET_AVAILABLE } from './marketplace';
 import { notifyPermission, usersWithPermission } from './notifications';
@@ -101,8 +101,8 @@ export async function measure(metric: AlertMetric, threshold: number, params: { 
       return v < threshold ? [{ key: y.toISOString().slice(0, 10), title: 'Yesterday’s revenue was low', body: `${v.toFixed(2)} (alert below ${threshold}).`, value: v, link: '/admin/insights' }] : [];
     }
     case 'failed_jobs_above': {
-      const counts = await Promise.all(QUEUE_NAMES.map((q) => queue(q).getJobCountByTypes('failed').catch(() => 0)));
-      const v = counts.reduce((x, y) => x + y, 0);
+      const counts = await queueCounts().catch(() => null);
+      const v = counts ? QUEUE_NAMES.reduce((sum, q) => sum + counts[q].failed, 0) : 0;
       return v > threshold ? [{ key: 'jobs', title: `${v} failed background jobs`, body: `Above your limit of ${threshold}. Review them in System health.`, value: v, link: '/admin/system' }] : [];
     }
   }
@@ -117,8 +117,8 @@ export async function evaluateAlertRules() {
     try {
       const hits = await measure(r.metric as AlertMetric, Number(r.threshold), (r.params ?? {}) as { industry?: string });
       for (const h of hits) {
-        const ok = await redis().set(`alert:${r.id}:${h.key}`, '1', 'EX', r.cooldownHours * 3600, 'NX').catch(() => 'OK');
-        if (ok !== 'OK') continue;
+        const ok = await claim(`alert:${r.id}:${h.key}`, r.cooldownHours * 3600).catch(() => true);
+        if (!ok) continue;
         await withPlatform((tx) => tx.alertRuleEvent.create({ data: { ruleId: r.id, title: h.title, body: h.body, value: h.value } }));
         await notifyPermission('marketplace.manage', null, { type: 'ALERT_RULE', title: h.title, body: `${r.name}: ${h.body}`, link: h.link });
         if (r.email) {

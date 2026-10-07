@@ -1,6 +1,7 @@
 import { prisma, withPlatform } from '../db';
 import { logger } from '../logger';
-import { redis } from '../redis';
+import { claim, pruneKv } from '../kv';
+import { pruneRateLimits } from '../ratelimit';
 import { getSetting } from '../settings';
 
 /** Runs every minute from the worker. Cheap housekeeping plus once-a-day retention work. */
@@ -12,13 +13,19 @@ export async function runMaintenance() {
   await prisma.approvalRequest.updateMany({ where: { status: 'PENDING', expiresAt: { lt: now } }, data: { status: 'EXPIRED' } });
   await prisma.passwordResetToken.deleteMany({ where: { expiresAt: { lt: new Date(now.getTime() - 7 * 86400_000) } } });
 
+  // Expired rate-limit windows and kv entries. Cheap, and keeps both tables bounded now
+  // that they hold what the key store used to expire on its own.
+  const [rateLimits, kv] = await Promise.all([pruneRateLimits(), pruneKv()]);
+
   // Once per day: audit retention.
   const day = now.toISOString().slice(0, 10);
-  const claimed = await redis().set(`maintenance:audit-retention:${day}`, '1', 'EX', 2 * 86400, 'NX');
+  const claimed = await claim(`maintenance:audit-retention:${day}`, 2 * 86400);
   let purged = 0;
   if (claimed) purged = await purgeAuditEvents();
-  if (sessions.count || purged) logger.info({ sessionsDeleted: sessions.count, auditPurged: purged }, 'maintenance');
-  return { sessionsDeleted: sessions.count, auditPurged: purged };
+  if (sessions.count || purged || rateLimits || kv) {
+    logger.info({ sessionsDeleted: sessions.count, auditPurged: purged, rateLimitsPruned: rateLimits, kvPruned: kv }, 'maintenance');
+  }
+  return { sessionsDeleted: sessions.count, auditPurged: purged, rateLimitsPruned: rateLimits, kvPruned: kv };
 }
 
 /**

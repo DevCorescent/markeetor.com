@@ -4,7 +4,7 @@ import { companyLinks } from '@/lib/company-registry';
 import type { AuthContext } from '../auth/context';
 import { withPlatform, withTenant } from '../db';
 import { AppError, notFound } from '../errors';
-import { redis } from '../redis';
+import { decr, getNumber, incr } from '../kv';
 import { getSetting } from '../settings';
 import { visibleLead } from './crm';
 import { aiStatus } from '../ai';
@@ -25,21 +25,20 @@ async function spendCredit(ctx: AuthContext) {
   const policy = await getSetting('enrichment.policy');
   if (!policy.clientResearch) throw new AppError('FORBIDDEN', 'Company research is not available right now');
   const key = `enrich:client:${ctx.orgId}:${new Date().toISOString().slice(0, 10)}`;
-  const used = await redis().incr(key).catch(() => 1);
-  if (used === 1) await redis().expire(key, 26 * 3600).catch(() => null);
+  const used = await incr(key, 26 * 3600).catch(() => 1);
   if (used > policy.clientDailyLimit) {
-    await redis().decr(key).catch(() => null);
+    await decr(key).catch(() => null);
     throw new AppError('RATE_LIMITED', `Your workspace has used today’s ${policy.clientDailyLimit} company research credits. Already-researched companies are always free to view.`);
   }
   return { used, limit: policy.clientDailyLimit };
 }
 async function refundCredit(ctx: AuthContext) {
-  await redis().decr(`enrich:client:${ctx.orgId}:${new Date().toISOString().slice(0, 10)}`).catch(() => null);
+  await decr(`enrich:client:${ctx.orgId}:${new Date().toISOString().slice(0, 10)}`).catch(() => null);
 }
 
 export async function researchQuota(ctx: AuthContext) {
   const policy = await getSetting('enrichment.policy');
-  const used = Number(await redis().get(`enrich:client:${ctx.orgId}:${new Date().toISOString().slice(0, 10)}`).catch(() => 0)) || 0;
+  const used = await getNumber(`enrich:client:${ctx.orgId}:${new Date().toISOString().slice(0, 10)}`).catch(() => 0);
   return { enabled: policy.clientResearch, used: Math.min(used, policy.clientDailyLimit), limit: policy.clientDailyLimit };
 }
 

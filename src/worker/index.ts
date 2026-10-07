@@ -1,14 +1,29 @@
 /**
  * Background worker: durable jobs for imports, distribution, automation, maintenance and email.
  * Run with `npm run worker` (separate process from the web server).
+ *
+ * Backed by Postgres (see src/server/jobs/queues.ts), not Redis. The loop claims due jobs
+ * with FOR UPDATE SKIP LOCKED, so running several worker processes is safe and needs no
+ * coordination. Per-queue concurrency is enforced by how many jobs each tick claims.
  */
 process.env.SERVICE_NAME ??= 'leads-crm-worker';
 
-import { Worker, type Job } from 'bullmq';
+import { randomUUID } from 'node:crypto';
 import { prisma } from '@/server/db';
-import { bullConnection, queue, type QueueName } from '@/server/jobs/queues';
+import {
+  claimJobs,
+  completeJob,
+  failJob,
+  pruneJobs,
+  QUEUE_NAMES,
+  reclaimStalled,
+  recordHeartbeat,
+  runDueSchedules,
+  upsertSchedule,
+  type ClaimedJob,
+  type QueueName,
+} from '@/server/jobs/queues';
 import { logger } from '@/server/logger';
-import { redis } from '@/server/redis';
 import { raiseAlert } from '@/server/security/alerts';
 import { deliverEmail } from '@/server/mail';
 import { executeBatch, runDueRules, runImportRules } from '@/server/services/distribution';
@@ -27,16 +42,16 @@ import { runBroadcasts } from '@/server/services/marketing';
 import { runSequences } from '@/server/services/sequences';
 import { handleEndpointEvent, handleImportLeadEvents, purgeEndpointData, sendEndpointMessage, sweepEndpointMessages } from '@/server/services/endpoints';
 
-type Handler = (job: Job) => Promise<unknown>;
+type Handler = (payload: Record<string, unknown>) => Promise<unknown>;
 
 const handlers: Record<QueueName, Record<string, Handler>> = {
   imports: {
-    validate: (job) => runValidation(job.data.importId),
-    process: (job) => runProcessing(job.data.importId),
+    validate: (p) => runValidation(p.importId as string),
+    process: (p) => runProcessing(p.importId as string),
   },
   distribution: {
-    execute: (job) => executeBatch(job.data.batchId),
-    'on-import': (job) => runImportRules(job.data.importId),
+    execute: (p) => executeBatch(p.batchId as string),
+    'on-import': (p) => runImportRules(p.importId as string),
     'rules-tick': () => runDueRules(),
   },
   automation: {
@@ -45,7 +60,7 @@ const handlers: Record<QueueName, Record<string, Handler>> = {
     funnels: () => runFunnelAutomations(),
     'saved-searches': () => runSavedSearches(),
     'weekly-reports': () => sendWeeklyReports(),
-    webhook: (job) => deliverWebhook(job.data.deliveryId),
+    webhook: (p) => deliverWebhook(p.deliveryId as string),
     'alert-rules': () => evaluateAlertRules(),
     'marketing-tick': async () => ({ sequences: await runSequences(), broadcasts: await runBroadcasts() }),
   },
@@ -55,90 +70,149 @@ const handlers: Record<QueueName, Record<string, Handler>> = {
     purge: () => purgeImportData(),
   },
   enrichment: {
-    lead: (job) => enrichLead(job.data.leadId, { apply: job.data.apply ?? undefined, force: job.data.force, actorId: job.data.actorId, batchId: job.data.batchId }),
-    import: (job) => enrichImport(job.data.importId),
+    lead: (p) =>
+      enrichLead(p.leadId as string, {
+        apply: (p.apply ?? undefined) as never,
+        force: p.force as boolean | undefined,
+        actorId: p.actorId as string,
+        batchId: p.batchId as string,
+      }),
+    import: (p) => enrichImport(p.importId as string),
     stale: () => failStaleEnrichment(),
   },
   email: {
-    deliver: (job) => deliverEmail(job.data.emailId),
-    campaign: (job) => runCampaign(job.data.campaignId),
-    'endpoint-message': (job) => sendEndpointMessage(job.data.messageId),
-    'endpoint-event': (job) => handleEndpointEvent(job.data.event, job.data.payload, job.data.key ?? null),
-    'endpoint-import': (job) => handleImportLeadEvents(job.data.importId),
+    deliver: (p) => deliverEmail(p.emailId as string),
+    campaign: (p) => runCampaign(p.campaignId as string),
+    'endpoint-message': (p) => sendEndpointMessage(p.messageId as string),
+    'endpoint-event': (p) => handleEndpointEvent(p.event as string, p.payload as never, (p.key ?? null) as string | null),
+    'endpoint-import': (p) => handleImportLeadEvents(p.importId as string),
     'endpoint-sweep': () => sweepEndpointMessages(),
     'endpoint-purge': () => purgeEndpointData(),
   },
 };
 
-const workers: Worker[] = [];
+/** How many jobs of each queue may run at once, mirroring the former BullMQ concurrency. */
+const CONCURRENCY: Record<QueueName, number> = {
+  imports: 2,
+  distribution: 1,
+  automation: 4,
+  maintenance: 4,
+  email: 4,
+  enrichment: 6,
+};
 
-for (const [name, map] of Object.entries(handlers) as [QueueName, Record<string, Handler>][]) {
-  const w = new Worker(
-    name,
-    async (job) => {
-      const fn = map[job.name];
-      if (!fn) throw new Error(`No handler for ${name}:${job.name}`);
-      const started = Date.now();
-      const res = await fn(job);
-      logger.info({ queue: name, job: job.name, id: job.id, ms: Date.now() - started }, 'job completed');
-      return res ?? null;
-    },
-    {
-      connection: bullConnection(),
-      prefix: process.env.QUEUE_PREFIX ?? 'lcrm',
-      concurrency: name === 'distribution' ? 1 : name === 'imports' ? 2 : name === 'enrichment' ? 6 : 4,
-      // Research is network-bound and polite: at most 4 leads started per second across the worker.
-      ...(name === 'enrichment' ? { limiter: { max: 4, duration: 1000 } } : {}),
-    },
-  );
-  w.on('failed', async (job, err) => {
-    logger.error({ queue: name, job: job?.name, id: job?.id, attempts: job?.attemptsMade, err }, 'job failed');
-    const exhausted = job && job.attemptsMade >= (job.opts.attempts ?? 1);
+const WORKER_ID = `${process.env.SERVICE_NAME}:${process.pid}:${randomUUID().slice(0, 8)}`;
+const POLL_MS = Number(process.env.JOB_POLL_MS ?? 2_000);
+
+/** Jobs currently running, per queue, so a tick never exceeds the concurrency budget. */
+const running = new Map<QueueName, number>(QUEUE_NAMES.map((q) => [q, 0]));
+let shuttingDown = false;
+
+async function runJob(job: ClaimedJob) {
+  const started = Date.now();
+  const fn = handlers[job.queue]?.[job.name];
+  try {
+    if (!fn) throw new Error(`No handler for ${job.queue}:${job.name}`);
+    await fn(job.payload);
+    await completeJob(job.id);
+    logger.info({ queue: job.queue, job: job.name, id: job.id, ms: Date.now() - started }, 'job completed');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const exhausted = await failJob(job, message).catch(() => false);
+    logger.error({ queue: job.queue, job: job.name, id: job.id, attempts: job.attempts, err }, 'job failed');
     if (!exhausted) return;
     // Dead-letter handling: final failure is surfaced as a platform alert and reflected on the domain record.
-    if (name === 'imports' && job?.data?.importId) await markImportFailed(job.data.importId, err.message).catch(() => null);
+    if (job.queue === 'imports' && job.payload.importId) {
+      await markImportFailed(job.payload.importId as string, message).catch(() => null);
+    }
     await raiseAlert({
-      type: 'JOB_FAILED', severity: 'MEDIUM', title: `Background job failed: ${name}/${job?.name}`,
-      details: { queue: name, job: job?.name, jobId: job?.id, error: err.message.slice(0, 500), data: job?.data },
-      dedupeKey: `jobfail:${name}:${job?.id}`,
-    });
-  });
-  workers.push(w);
+      type: 'JOB_FAILED',
+      severity: 'MEDIUM',
+      title: `Background job failed: ${job.queue}/${job.name}`,
+      details: { queue: job.queue, job: job.name, jobId: job.id, error: message.slice(0, 500), data: job.payload },
+      dedupeKey: `jobfail:${job.queue}:${job.id}`,
+    }).catch((err) => logger.error({ err }, 'could not raise job failure alert'));
+  } finally {
+    running.set(job.queue, Math.max(0, (running.get(job.queue) ?? 1) - 1));
+  }
 }
 
-async function scheduleRepeatables() {
-  await queue('maintenance').upsertJobScheduler('maintenance-tick', { every: 60_000 }, { name: 'tick', data: {} });
-  await queue('maintenance').upsertJobScheduler('maintenance-purge', { pattern: '17 3 * * *' }, { name: 'purge', data: {} });
-  await queue('distribution').upsertJobScheduler('rules-tick', { every: 60_000 }, { name: 'rules-tick', data: {} });
-  await queue('automation').upsertJobScheduler('automation-scan', { every: 5 * 60_000 }, { name: 'scan', data: {} });
-  await queue('automation').upsertJobScheduler('funnel-automations', { every: 5 * 60_000 }, { name: 'funnels', data: {} });
-  await queue('enrichment').upsertJobScheduler('enrichment-stale', { every: 15 * 60_000 }, { name: 'stale', data: {} });
-  await queue('automation').upsertJobScheduler('saved-searches', { every: 15 * 60_000 }, { name: 'saved-searches', data: {} });
-  await queue('automation').upsertJobScheduler('marketing-tick', { every: 60_000 }, { name: 'marketing-tick', data: {} });
-  await queue('automation').upsertJobScheduler('alert-rules', { every: 15 * 60_000 }, { name: 'alert-rules', data: {} });
-  await queue('automation').upsertJobScheduler('weekly-reports', { pattern: '0 8 * * 1' }, { name: 'weekly-reports', data: {} });
-  await queue('automation').upsertJobScheduler('scheduled-reports', { pattern: '0 7 * * *' }, { name: 'reports', data: {} });
-  await queue('email').upsertJobScheduler('endpoint-sweep', { every: 60_000 }, { name: 'endpoint-sweep', data: {} });
-  await queue('email').upsertJobScheduler('endpoint-purge', { pattern: '41 3 * * *' }, { name: 'endpoint-purge', data: {} });
+/** Claims whatever each queue has spare capacity for and starts it without awaiting. */
+async function tick() {
+  const hungry = QUEUE_NAMES.filter((q) => (running.get(q) ?? 0) < CONCURRENCY[q]);
+  if (!hungry.length) return;
+  // Claim per queue so one busy queue cannot starve the others of its budget.
+  for (const queue of hungry) {
+    const capacity = CONCURRENCY[queue] - (running.get(queue) ?? 0);
+    const jobs = await claimJobs([queue], capacity, WORKER_ID);
+    for (const job of jobs) {
+      running.set(queue, (running.get(queue) ?? 0) + 1);
+      void runJob(job);
+    }
+  }
 }
 
-const heartbeat = setInterval(() => {
-  redis().set('worker:heartbeat', new Date().toISOString(), 'EX', 120).catch(() => null);
-}, 15_000);
-
-scheduleRepeatables()
-  .then(() => {
-    redis().set('worker:heartbeat', new Date().toISOString(), 'EX', 120).catch(() => null);
-    logger.info({ queues: Object.keys(handlers) }, 'worker started');
-  })
-  .catch((err) => logger.error({ err }, 'failed to schedule repeatable jobs'));
-
-async function shutdown(signal: string) {
-  logger.info({ signal }, 'worker shutting down');
-  clearInterval(heartbeat);
-  await Promise.allSettled(workers.map((w) => w.close()));
-  await prisma.$disconnect();
-  process.exit(0);
+async function registerSchedules() {
+  await upsertSchedule('maintenance-tick', { queue: 'maintenance', name: 'tick', everyMs: 60_000 });
+  await upsertSchedule('maintenance-purge', { queue: 'maintenance', name: 'purge', cron: '17 3 * * *' });
+  await upsertSchedule('rules-tick', { queue: 'distribution', name: 'rules-tick', everyMs: 60_000 });
+  await upsertSchedule('automation-scan', { queue: 'automation', name: 'scan', everyMs: 5 * 60_000 });
+  await upsertSchedule('funnel-automations', { queue: 'automation', name: 'funnels', everyMs: 5 * 60_000 });
+  await upsertSchedule('enrichment-stale', { queue: 'enrichment', name: 'stale', everyMs: 15 * 60_000 });
+  await upsertSchedule('saved-searches', { queue: 'automation', name: 'saved-searches', everyMs: 15 * 60_000 });
+  await upsertSchedule('marketing-tick', { queue: 'automation', name: 'marketing-tick', everyMs: 60_000 });
+  await upsertSchedule('alert-rules', { queue: 'automation', name: 'alert-rules', everyMs: 15 * 60_000 });
+  await upsertSchedule('weekly-reports', { queue: 'automation', name: 'weekly-reports', cron: '0 8 * * 1' });
+  await upsertSchedule('scheduled-reports', { queue: 'automation', name: 'reports', cron: '0 7 * * *' });
+  await upsertSchedule('endpoint-sweep', { queue: 'email', name: 'endpoint-sweep', everyMs: 60_000 });
+  await upsertSchedule('endpoint-purge', { queue: 'email', name: 'endpoint-purge', cron: '41 3 * * *' });
 }
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+
+/** Repeats `fn` every `everyMs` until shutdown, logging rather than throwing. */
+function every(everyMs: number, label: string, fn: () => Promise<unknown>) {
+  const timer = setInterval(() => {
+    if (shuttingDown) return;
+    void fn().catch((err) => logger.error({ err, task: label }, 'worker task failed'));
+  }, everyMs);
+  timer.unref?.();
+  return timer;
+}
+
+async function main() {
+  await registerSchedules();
+  await recordHeartbeat(process.env.SERVICE_NAME!, { workerId: WORKER_ID, queues: QUEUE_NAMES });
+  logger.info({ queues: QUEUE_NAMES, workerId: WORKER_ID, pollMs: POLL_MS }, 'worker started');
+
+  const timers = [
+    every(POLL_MS, 'poll', tick),
+    every(60_000, 'schedules', runDueSchedules),
+    every(15_000, 'heartbeat', () => recordHeartbeat(process.env.SERVICE_NAME!, { workerId: WORKER_ID })),
+    every(60_000, 'reclaim', () => reclaimStalled()),
+    every(6 * 3_600_000, 'prune', () => pruneJobs()),
+  ];
+
+  // Fire the schedule tick once at boot so a timer that came due while the worker was
+  // down runs immediately rather than waiting a full minute.
+  await runDueSchedules().catch((err) => logger.error({ err }, 'initial schedule tick failed'));
+
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info({ signal }, 'worker shutting down');
+    for (const t of timers) clearInterval(t);
+    // Let in-flight handlers finish so their jobs are not left ACTIVE for the reclaimer.
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline && [...running.values()].some((n) => n > 0)) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    await prisma.$disconnect().catch(() => null);
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+}
+
+main().catch((err) => {
+  logger.error({ err }, 'worker failed to start');
+  process.exit(1);
+});

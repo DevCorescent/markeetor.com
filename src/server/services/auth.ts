@@ -8,7 +8,7 @@ import { prisma, withPlatform } from '../db';
 import { AppError } from '../errors';
 import { sendEmail } from '../mail';
 import { rateLimit } from '../ratelimit';
-import { redis } from '../redis';
+import { del as kvDel, get as kvGet, set as kvSet } from '../kv';
 import { onLoginFailure, raiseAlert } from '../security/alerts';
 import { getSetting } from '../settings';
 import { productName } from '../branding';
@@ -155,20 +155,20 @@ export async function startMfaEnrollment(ctx: AuthContext) {
   const user = await prisma.user.findUniqueOrThrow({ where: { id: ctx.user.id } });
   if (user.mfaEnabled) throw new AppError('CONFLICT', 'Two-factor authentication is already enabled');
   const secret = newTotpSecret();
-  await redis().set(ENROLL_KEY(user.id), encryptSecret(secret), 'EX', 600);
+  await kvSet(ENROLL_KEY(user.id), encryptSecret(secret), 600);
   const { uri, qr } = await totpProvisioning(user.email, secret);
   return { secret, uri, qr };
 }
 
 export async function confirmMfaEnrollment(ctx: AuthContext, code: string) {
-  const enc = await redis().get(ENROLL_KEY(ctx.user.id));
+  const enc = await kvGet(ENROLL_KEY(ctx.user.id));
   if (!enc) throw new AppError('PRECONDITION_FAILED', 'Enrollment expired. Start again.');
   const secret = decryptSecret(enc);
   if (!verifyTotp(secret, code)) throw new AppError('VALIDATION_FAILED', 'That code is not valid. Check your device clock and try again.');
   const { codes, hashes } = newRecoveryCodes();
   await prisma.user.update({ where: { id: ctx.user.id }, data: { mfaEnabled: true, mfaSecretEnc: encryptSecret(secret), mfaRecoveryHashes: hashes } });
   if (ctx.session) await prisma.session.update({ where: { id: ctx.session.id }, data: { mfaVerifiedAt: new Date(), stepUpAt: new Date() } });
-  await redis().del(ENROLL_KEY(ctx.user.id));
+  await kvDel(ENROLL_KEY(ctx.user.id));
   await auditDetached(ctx, { action: 'auth.mfa.enrolled', targetType: 'user', targetId: ctx.user.id });
   return { recoveryCodes: codes };
 }

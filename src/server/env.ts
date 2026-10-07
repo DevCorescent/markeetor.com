@@ -4,7 +4,6 @@ const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   APP_URL: z.string().url().default('http://localhost:3000'),
   DATABASE_URL: z.string().min(1),
-  REDIS_URL: z.string().default('redis://localhost:6379/0'),
   // 32 random bytes, base64. Used for AES-256-GCM encryption of MFA secrets.
   ENCRYPTION_KEY: z.string().refine((v) => Buffer.from(v, 'base64').length === 32, 'ENCRYPTION_KEY must be 32 bytes base64'),
   SESSION_SECRET: z.string().min(32),

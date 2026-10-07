@@ -10,7 +10,7 @@ import { can, type AuthContext } from '../auth/context';
 import { withPlatform, withTenant, type Tx } from '../db';
 import { AppError, notFound } from '../errors';
 import { logger } from '../logger';
-import { redis } from '../redis';
+import { decr, getNumber, incr } from '../kv';
 import { getSetting, invalidateSetting } from '../settings';
 import { chargeCredits } from './credits';
 import { buildClientLeadWhere } from './lead-filters';
@@ -127,7 +127,7 @@ export async function sendToLead(input: { organizationId: string; clientLeadId: 
   const o = s.overrides.find((x) => x.organizationId === input.organizationId);
   const limit = o?.messagesPerDay ?? s.limits.messagesPerDay;
   const dayKey = `mkt:sent:${input.organizationId}:${new Date().toISOString().slice(0, 10)}`;
-  const used = Number(await redis().get(dayKey).catch(() => 0)) || 0;
+  const used = await getNumber(dayKey).catch(() => 0);
   if (limit && used >= limit) { const t = new Date(); t.setUTCHours(24, 5, 0, 0); return { status: 'DEFERRED', reason: 'Daily message limit reached', retryAt: t }; }
 
   const prep = await withTenant(input.organizationId, async (tx) => {
@@ -164,7 +164,7 @@ export async function sendToLead(input: { organizationId: string; clientLeadId: 
     const m = await record({ to: prep.phone, body: prep.text, status: 'FAILED', error: (err as Error).message.slice(0, 300) });
     return { status: 'FAILED', reason: (err as Error).message, messageId: m.id };
   }
-  await redis().multi().incr(dayKey).expire(dayKey, 26 * 3600).exec().catch(() => null);
+  await incr(dayKey, 26 * 3600).catch(() => null);
   const m = await record({ to: prep.phone, body: prep.text, status: sent.status, provider: sent.provider, providerMessageId: sent.providerMessageId, credits: Math.ceil(price) });
   await withTenant(input.organizationId, async (tx) => {
     await tx.communicationLog.create({ data: { organizationId: input.organizationId, clientLeadId: input.clientLeadId, userId: input.actorId, channel: input.channel, direction: 'OUTBOUND', outcome: 'SENT', body: prep.text.slice(0, 2000), verification: 'SYSTEM_VERIFIED', provider: sent.provider, providerMessageId: sent.providerMessageId } });
@@ -335,9 +335,8 @@ function templateWrite(i: z.infer<typeof writeInput>, org: string) {
 export async function aiWrite(ctx: AuthContext, input: z.infer<typeof writeInput>) {
   const s = await assertFeature(ctx, 'aiWriter');
   const dayKey = `mkt:ai:${ctx.orgId}:${new Date().toISOString().slice(0, 10)}`;
-  const used = await redis().incr(dayKey).catch(() => 1);
-  if (used === 1) await redis().expire(dayKey, 26 * 3600).catch(() => null);
-  if (s.limits.aiDraftsPerDay && used > s.limits.aiDraftsPerDay) { await redis().decr(dayKey).catch(() => null); throw new AppError('RATE_LIMITED', `Daily AI writing limit (${s.limits.aiDraftsPerDay}) reached`); }
+  const used = await incr(dayKey, 26 * 3600).catch(() => 1);
+  if (s.limits.aiDraftsPerDay && used > s.limits.aiDraftsPerDay) { await decr(dayKey).catch(() => null); throw new AppError('RATE_LIMITED', `Daily AI writing limit (${s.limits.aiDraftsPerDay}) reached`); }
   const org = await withPlatform((tx) => tx.organization.findUniqueOrThrow({ where: { id: ctx.orgId! }, select: { name: true, industry: true } }));
   const ai = await aiStatus();
   let text: string | null = null;

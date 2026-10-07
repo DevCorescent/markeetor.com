@@ -21,7 +21,7 @@ const csp = [
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
-  serverExternalPackages: ['@node-rs/argon2', 'bullmq', 'ioredis', 'exceljs', 'pino'],
+  serverExternalPackages: ['@node-rs/argon2', 'exceljs', 'pino'],
   async headers() {
     return [
       {

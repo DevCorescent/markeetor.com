@@ -32,7 +32,7 @@ import { normalizeEmail, toCsv } from './normalize';
  *    → sendEndpointMessage (worker): claim, re-check window/suppression/frequency cap/sender limits,
  *      render, send, retry with backoff; every step lands on the message's timeline.
  *
- * A once-a-minute sweep re-queues anything whose job was lost, so a Redis hiccup never drops mail.
+ * A once-a-minute sweep re-queues anything whose job was lost, so a failed enqueue never drops mail.
  */
 
 const APP_URL = () => process.env.APP_URL ?? 'http://localhost:3000';
@@ -334,7 +334,7 @@ export async function ingest(ep: EmailEndpoint, payload: unknown, o: { source: S
 
 async function schedule(messageId: string, at: Date | null, attempt = 0) {
   const delay = at ? Math.max(0, at.getTime() - Date.now()) : 0;
-  // If Redis is unavailable the sweep picks the message up once it is due.
+  // If the enqueue fails the sweep picks the message up once it is due.
   await enqueue('email', 'endpoint-message', { messageId }, { jobId: `epmsg-${messageId}-${attempt}-${Date.now()}`, delay }).catch((err) => logger.warn({ err, messageId }, 'failed to enqueue endpoint message'));
 }
 
