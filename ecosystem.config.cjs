@@ -43,9 +43,13 @@ module.exports = {
       name: 'markeetor-worker',
       cwd,
       script: path.join(cwd, 'node_modules/tsx/dist/cli.mjs'),
-      args: 'src/worker/index.ts',
+      args: path.join(cwd, 'src/worker/index.ts'),
       interpreter: 'node',
-      interpreter_args: '--env-file=.env',
+      // Absolute path on purpose: node resolves --env-file against its own working
+      // directory, and pm2 does not reliably apply `cwd` before the interpreter starts.
+      // A relative '.env' that does not resolve makes node exit immediately, which looks
+      // exactly like the worker crash-looping.
+      interpreter_args: `--env-file=${path.join(cwd, '.env')}`,
       instances: 1,
       exec_mode: 'fork',
       env: { NODE_ENV: 'production', SERVICE_NAME: 'leads-crm-worker' },
