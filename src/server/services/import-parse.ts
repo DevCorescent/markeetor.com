@@ -1,7 +1,7 @@
 import ExcelJS from 'exceljs';
 import Papa from 'papaparse';
 import { createReadStream } from 'node:fs';
-import { open } from 'node:fs/promises';
+import { access, open } from 'node:fs/promises';
 import { detectDelimiter, detectHeaderRow } from './import-detect';
 
 export const MAX_COLUMNS = 100;
@@ -51,9 +51,23 @@ const clip = (s: string) => (s.length > MAX_CELL ? s.slice(0, MAX_CELL) : s);
 
 /** Streams every row (including any header) as arrays of strings, from the chosen sheet / with the chosen delimiter. */
 export async function* iterateRows(path: string, kind: FileKind, opts: ParseOptions = {}): AsyncGenerator<string[]> {
+  // Fail with something an operator can act on. The usual cause is STORAGE_DIR differing
+  // between the web process (which wrote the upload) and the worker (which reads it) —
+  // they must point at the same directory, and on more than one host it must be shared.
+  try {
+    await access(path);
+  } catch {
+    throw new Error(`Uploaded file is missing from storage (${path}). Check that STORAGE_DIR is the same for the web server and the worker.`);
+  }
+
   if (kind === 'csv') {
     const parser = Papa.parse(Papa.NODE_STREAM_INPUT, { header: false, skipEmptyLines: 'greedy', delimiter: opts.delimiter ?? '' });
     const source = createReadStream(path, { encoding: 'utf8' });
+    // A stream 'error' event with no listener is fatal to the whole process, not just this
+    // call — an unreadable upload would take down the worker (and then crash-loop on the
+    // same job) or the web server. Forwarding it into the parser makes the for-await below
+    // reject instead, so the caller fails the one import and everything else keeps running.
+    source.on('error', (err) => parser.destroy(err));
     source.pipe(parser);
     let first = true;
     try {
