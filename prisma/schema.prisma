@@ -1,0 +1,2400 @@
+// markeetor.com — tenant-aware data model.
+//
+// Tenancy model (see DEVELOPMENT.md → "Lead ownership model"):
+//   * `Lead` is the platform-owned MASTER record. Client users never read it.
+//   * `LeadAssignment` records which organization currently holds a lead
+//     (at most one ACTIVE assignment per lead, enforced by a partial unique index).
+//   * `ClientLead` is the tenant-specific PROJECTION created at assignment time.
+//     All client CRM work (status, stage, notes, tasks, communication) hangs off it.
+//     When a lead is revoked/reassigned, the old projection is hidden from the old
+//     tenant and never shown to the new one.
+//
+// Tables carrying `organizationId` that are tenant-private are protected by
+// PostgreSQL row-level security (see prisma/migrations/*_rls). Column names are
+// left in Prisma's camelCase, so raw SQL must quote them ("organizationId").
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum UserStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum RoleScope {
+  PLATFORM
+  ORGANIZATION
+}
+
+enum OrgStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+enum OverrideEffect {
+  GRANT
+  DENY
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+  EXPIRED
+}
+
+enum LeadQuality {
+  VALID
+  INVALID
+}
+
+enum AllocationStatus {
+  UNALLOCATED
+  PENDING
+  ALLOCATED
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum ImportStatus {
+  UPLOADED
+  VALIDATING
+  PREVIEW_READY
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+  ROLLED_BACK
+}
+
+enum ImportRowStatus {
+  VALID
+  INVALID
+  DUPLICATE
+  INSERTED
+  UPDATED
+  SKIPPED
+  FAILED
+}
+
+enum BatchStatus {
+  SCHEDULED
+  QUEUED
+  PROCESSING
+  COMPLETED
+  PARTIAL
+  FAILED
+  CANCELLED
+  ROLLED_BACK
+}
+
+enum BatchItemStatus {
+  PENDING
+  ASSIGNED
+  SKIPPED
+  FAILED
+  ROLLED_BACK
+}
+
+enum AssignmentStatus {
+  ACTIVE
+  REVOKED
+  REASSIGNED
+  ROLLED_BACK
+}
+
+enum DistributionStrategy {
+  EQUAL
+  CUSTOM
+  ROUND_ROBIN
+  WEIGHTED
+  QUOTA
+  CAPACITY
+  GEOGRAPHY
+  INDUSTRY
+  CAMPAIGN
+  SCORE
+}
+
+enum ClientLeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  NEGOTIATION
+  CONVERTED
+  LOST
+}
+
+enum StageCategory {
+  OPEN
+  WON
+  LOST
+}
+
+enum ActivityVerification {
+  SYSTEM_VERIFIED
+  SELF_REPORTED
+  PROVIDER_VERIFIED
+}
+
+enum TaskType {
+  TODO
+  CALL
+  MEETING
+  EMAIL
+  FOLLOW_UP
+}
+
+enum TaskStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+enum Recurrence {
+  NONE
+  DAILY
+  WEEKLY
+  MONTHLY
+}
+
+enum CommChannel {
+  CALL
+  EMAIL
+  SMS
+  WHATSAPP
+  MEETING
+}
+
+enum CommDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum ConsentStatus {
+  OPTED_IN
+  OPTED_OUT
+}
+
+enum FieldType {
+  TEXT
+  NUMBER
+  DATE
+  SELECT
+  BOOLEAN
+}
+
+enum AuditResult {
+  SUCCESS
+  DENIED
+  FAILURE
+}
+
+enum AlertSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum AlertStatus {
+  OPEN
+  INVESTIGATING
+  RESOLVED
+  DISMISSED
+}
+
+enum ExecutionStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  SKIPPED
+  DEAD
+}
+
+enum EmailStatus {
+  QUEUED
+  SENT
+  LOGGED_ONLY
+  FAILED
+}
+
+// ─────────────────────── Identity & access ───────────────────────
+
+model User {
+  id                    String     @id @default(cuid())
+  email                 String     @unique // stored lower-cased
+  name                  String
+  passwordHash          String?
+  status                UserStatus @default(INVITED)
+  isPlatformUser        Boolean    @default(false)
+  mfaEnabled            Boolean    @default(false)
+  mfaSecretEnc          String? // AES-256-GCM encrypted TOTP secret
+  mfaRecoveryHashes     String[]   @default([])
+  failedLoginCount      Int        @default(0)
+  lockedUntil           DateTime?
+  lastLoginAt           DateTime?
+  lastLoginIp           String?
+  passwordChangedAt     DateTime?
+  /// Set for accounts created with an emailed temporary password; cleared once the user picks their own.
+  mustChangePassword    Boolean    @default(false)
+  tempPasswordExpiresAt DateTime?
+  title                 String?
+  phone                 String?
+  createdAt             DateTime   @default(now())
+  updatedAt             DateTime   @updatedAt
+
+  membership       Membership?
+  sessions         Session[]
+  loginEvents      LoginEvent[]
+  notifications    Notification[]
+  resetTokens      PasswordResetToken[]
+  ownedClientLeads ClientLead[]         @relation("ClientLeadOwner")
+  tasksAssigned    Task[]               @relation("TaskAssignee")
+  teamMemberships  TeamMember[]
+  savedViews       SavedView[]
+
+  @@map("users")
+}
+
+model Organization {
+  id           String    @id @default(cuid())
+  code         String    @unique // human-facing identifier, e.g. ORG-7XK2Q9
+  slug         String    @unique
+  name         String
+  legalName    String?
+  industry     String?
+  website      String?
+  contactEmail String?
+  contactPhone String?
+  address      String?
+  timezone     String    @default("UTC")
+  logoKey      String?
+  status       OrgStatus @default(ACTIVE)
+  // { features: {...}, security: { mfaRequired, sessionIdleMinutes, ipAllowlist[] }, notifications: {...} }
+  settings     Json      @default("{}")
+  statusReason String?
+  /// Tax registration for invoices (India: 15-character GSTIN) and the state it is registered in.
+  gstin        String?
+  billingState String?
+  archivedAt   DateTime?
+  createdById  String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  memberships Membership[]
+  quota       ClientQuota?
+  roles       Role[]
+  assignments LeadAssignment[]
+  clientLeads ClientLead[]
+
+  @@index([status])
+  @@map("organizations")
+}
+
+model ClientQuota {
+  id                      String       @id @default(cuid())
+  organizationId          String       @unique
+  organization            Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  maxUsers                Int          @default(25)
+  maxActiveLeads          Int          @default(5000)
+  dailyAllocationLimit    Int          @default(1000)
+  monthlyAllocationLimit  Int          @default(20000)
+  weight                  Int          @default(1)
+  acceptsAutoDistribution Boolean      @default(true)
+  autoPauseAtCapacity     Boolean      @default(true)
+  capacityPaused          Boolean      @default(false)
+  pausedAt                DateTime?
+  // Eligibility profile used by rule-based distribution.
+  regions                 String[]     @default([])
+  industries              String[]     @default([])
+  campaigns               String[]     @default([])
+  minScore                Int?
+  maxScore                Int?
+  updatedAt               DateTime     @updatedAt
+
+  @@map("client_quotas")
+}
+
+model Role {
+  id             String        @id @default(cuid())
+  key            String
+  name           String
+  description    String?
+  scope          RoleScope
+  organizationId String? // null → system role template available to every org (for ORGANIZATION scope)
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  isSystem       Boolean       @default(false)
+  isPrivileged   Boolean       @default(false) // granting requires approval
+  rank           Int           @default(0) // higher = more privileged; prevents escalation
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  permissions RolePermission[]
+  memberships Membership[]
+
+  @@unique([organizationId, key])
+  @@map("roles")
+}
+
+model Permission {
+  key         String    @id
+  description String
+  scope       RoleScope
+  sensitive   Boolean   @default(false)
+  group       String
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId        String
+  permissionKey String
+  role          Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission    Permission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+
+  @@id([roleId, permissionKey])
+  @@map("role_permissions")
+}
+
+// v1: one membership per user (a user belongs to the platform OR exactly one org).
+model Membership {
+  id             String        @id @default(cuid())
+  userId         String        @unique
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  roleId         String
+  role           Role          @relation(fields: [roleId], references: [id])
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  overrides PermissionOverride[]
+
+  @@index([organizationId])
+  @@map("memberships")
+}
+
+model PermissionOverride {
+  id            String         @id @default(cuid())
+  membershipId  String
+  membership    Membership     @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  permissionKey String
+  effect        OverrideEffect
+  reason        String
+  grantedById   String
+  expiresAt     DateTime?
+  createdAt     DateTime       @default(now())
+
+  @@unique([membershipId, permissionKey])
+  @@map("permission_overrides")
+}
+
+model Session {
+  id            String    @id @default(cuid())
+  tokenHash     String    @unique
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mfaPending    Boolean   @default(false)
+  mfaVerifiedAt DateTime?
+  stepUpAt      DateTime?
+  ip            String?
+  userAgent     String?
+  createdAt     DateTime  @default(now())
+  lastSeenAt    DateTime  @default(now())
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  revokedReason String?
+
+  @@index([userId, revokedAt])
+  @@map("sessions")
+}
+
+model LoginEvent {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  email     String
+  success   Boolean
+  reason    String?
+  ip        String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([email, createdAt])
+  @@index([ip, createdAt])
+  @@index([createdAt])
+  @@map("login_events")
+}
+
+model Invitation {
+  id             String    @id @default(cuid())
+  email          String
+  name           String
+  organizationId String?
+  roleId         String
+  tokenHash      String    @unique
+  invitedById    String
+  userId         String?
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([email])
+  @@index([organizationId])
+  @@map("invitations")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@map("password_reset_tokens")
+}
+
+model ApprovalRequest {
+  id            String         @id @default(cuid())
+  type          String // ROLE_GRANT_PRIVILEGED | DISTRIBUTION_ROLLBACK_FORCED | ...
+  summary       String
+  payload       Json
+  status        ApprovalStatus @default(PENDING)
+  requestedById String
+  decidedById   String?
+  decidedAt     DateTime?
+  decisionNote  String?
+  expiresAt     DateTime
+  createdAt     DateTime       @default(now())
+
+  @@index([status, createdAt])
+  @@map("approval_requests")
+}
+
+model ApiKey {
+  id             String    @id @default(cuid())
+  organizationId String?
+  name           String
+  prefix         String    @unique
+  keyHash        String
+  scopes         String[]
+  createdById    String
+  lastUsedAt     DateTime?
+  lastUsedIp     String?
+  expiresAt      DateTime?
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@map("api_keys")
+}
+
+// ───────────────────────── Master leads ─────────────────────────
+
+model Lead {
+  id                     String            @id @default(cuid())
+  fullName               String
+  email                  String?
+  emailNormalized        String?
+  phone                  String?
+  phoneNormalized        String? // E.164
+  secondaryPhone         String?
+  company                String?
+  jobTitle               String?
+  country                String?
+  state                  String?
+  city                   String?
+  industry               String?
+  source                 String?
+  campaign               String?
+  score                  Int               @default(0)
+  priority               Priority          @default(MEDIUM)
+  quality                LeadQuality       @default(VALID)
+  qualityIssues          String[]          @default([])
+  allocationStatus       AllocationStatus  @default(UNALLOCATED)
+  assignedOrganizationId String?
+  duplicateOfId          String?
+  mergedIntoId           String?
+  customFields           Json              @default("{}")
+  importBatchId          String?
+  importBatch            ImportBatch?      @relation(fields: [importBatchId], references: [id], onDelete: SetNull)
+  lastActivityAt         DateTime?
+  nextFollowUpAt         DateTime?
+  clientStatus           ClientLeadStatus? // denormalized from active projection, for global analytics
+  distributionCount      Int               @default(0) // how many times this lead has been allocated to a client
+  lastDistributedAt      DateTime?
+  archivedAt             DateTime?
+  archivedReason         String?
+  createdById            String?
+  createdAt              DateTime          @default(now())
+  updatedAt              DateTime          @updatedAt
+
+  tags        LeadTag[]
+  assignments LeadAssignment[]
+  batchItems  AssignmentBatchItem[]
+  enrichment  LeadEnrichment?
+
+  @@index([emailNormalized])
+  @@index([phoneNormalized])
+  @@index([allocationStatus, archivedAt])
+  @@index([assignedOrganizationId])
+  @@index([source])
+  @@index([campaign])
+  @@index([industry])
+  @@index([country])
+  @@index([createdAt])
+  @@index([score])
+  @@index([importBatchId])
+  @@index([distributionCount])
+  @@index([lastDistributedAt])
+  @@index([fullName(ops: raw("gin_trgm_ops"))], type: Gin, map: "leads_fullname_trgm")
+  @@index([company(ops: raw("gin_trgm_ops"))], type: Gin, map: "leads_company_trgm")
+  @@index([emailNormalized(ops: raw("gin_trgm_ops"))], type: Gin, map: "leads_email_trgm")
+  @@map("leads")
+}
+
+model Tag {
+  id             String   @id @default(cuid())
+  organizationId String? // null → platform tag
+  name           String
+  color          String?
+  createdAt      DateTime @default(now())
+
+  leads       LeadTag[]
+  clientLeads ClientLeadTag[]
+
+  @@unique([organizationId, name])
+  @@map("tags")
+}
+
+model LeadTag {
+  leadId String
+  tagId  String
+  lead   Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  tag    Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([leadId, tagId])
+  @@map("lead_tags")
+}
+
+model CustomFieldDefinition {
+  id             String    @id @default(cuid())
+  organizationId String? // null → platform (master lead) field
+  key            String
+  label          String
+  type           FieldType @default(TEXT)
+  options        String[]  @default([])
+  required       Boolean   @default(false)
+  position       Int       @default(0)
+  createdAt      DateTime  @default(now())
+
+  @@unique([organizationId, key])
+  @@map("lead_custom_fields")
+}
+
+// ─────────────────────────── Imports ───────────────────────────
+
+model ImportBatch {
+  id             String       @id @default(cuid())
+  code           String       @unique
+  fileName       String
+  fileSize       Int
+  fileType       String // csv | xlsx
+  storageKey     String?
+  fileDeletedAt  DateTime?
+  status         ImportStatus @default(UPLOADED)
+  headers        String[]     @default([])
+  mapping        Json         @default("{}") // { columnHeader: fieldKey }
+  options        Json         @default("{}") // { dedupeKeys, onDuplicate, requiredFields, defaultCountry }
+  source         String?
+  campaign       String?
+  tags           String[]     @default([])
+  totalRows      Int          @default(0)
+  processedRows  Int          @default(0)
+  validCount     Int          @default(0)
+  invalidCount   Int          @default(0)
+  duplicateCount Int          @default(0)
+  insertedCount  Int          @default(0)
+  updatedCount   Int          @default(0)
+  skippedCount   Int          @default(0)
+  failedCount    Int          @default(0)
+  error          String?
+  templateId     String?
+  // Draft / smart-parsing state (wizard can be resumed and stepped back through until confirmed).
+  draftStep      String       @default("mapping")
+  sheetName      String?
+  sheets         Json         @default("[]")
+  headerRow      Int          @default(1)
+  delimiter      String?
+  encoding       String?
+  detection      Json         @default("{}") // per-column suggested field, confidence and reasons
+  createdById    String
+  confirmedAt    DateTime?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  rolledBackAt   DateTime?
+  rolledBackById String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  rows  ImportRow[]
+  leads Lead[]
+
+  @@index([status, createdAt])
+  @@map("imports")
+}
+
+model ImportRow {
+  id          String          @id @default(cuid())
+  importId    String
+  import      ImportBatch     @relation(fields: [importId], references: [id], onDelete: Cascade)
+  rowNumber   Int
+  raw         Json
+  normalized  Json?
+  status      ImportRowStatus
+  errors      String[]        @default([])
+  matchLeadId String?
+  leadId      String?
+  before      Json? // snapshot for UPDATED rows, enables rollback
+
+  @@unique([importId, rowNumber])
+  @@index([importId, status])
+  @@map("import_rows")
+}
+
+model ImportTemplate {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  mapping     Json
+  options     Json     @default("{}")
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("import_templates")
+}
+
+// ───────────────────────── Distribution ─────────────────────────
+
+model AssignmentBatch {
+  id             String               @id @default(cuid())
+  code           String               @unique
+  mode           String // MANUAL | RULE | REASSIGN
+  strategy       DistributionStrategy
+  selection      Json // criteria used to select leads (filter or explicit ids)
+  targets        Json // [{ organizationId, quantity?, weight? }]
+  rules          Json                 @default("{}")
+  ruleId         String?
+  idempotencyKey String               @unique
+  status         BatchStatus          @default(QUEUED)
+  scheduledFor   DateTime?
+  selectedCount  Int                  @default(0)
+  allocatedCount Int                  @default(0)
+  failedCount    Int                  @default(0)
+  skippedCount   Int                  @default(0)
+  pendingCount   Int                  @default(0)
+  initiatedById  String
+  note           String?
+  error          String?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  rolledBackAt   DateTime?
+  rolledBackById String?
+  rollbackReason String?
+  rollbackCount  Int                  @default(0)
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  items       AssignmentBatchItem[]
+  assignments LeadAssignment[]
+
+  @@index([status, createdAt])
+  @@index([scheduledFor])
+  @@map("assignment_batches")
+}
+
+model AssignmentBatchItem {
+  id             String          @id @default(cuid())
+  batchId        String
+  batch          AssignmentBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  leadId         String
+  lead           Lead            @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  organizationId String?
+  status         BatchItemStatus @default(PENDING)
+  reason         String?
+  assignmentId   String?
+  processedAt    DateTime?
+
+  @@unique([batchId, leadId])
+  @@index([batchId, status])
+  @@index([organizationId])
+  @@map("assignment_batch_items")
+}
+
+model LeadAssignment {
+  id             String           @id @default(cuid())
+  leadId         String
+  lead           Lead             @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  organizationId String
+  organization   Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  batchId        String?
+  batch          AssignmentBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  status         AssignmentStatus @default(ACTIVE)
+  assignedById   String
+  assignedAt     DateTime         @default(now())
+  endedAt        DateTime?
+  endedById      String?
+  endedReason    String?
+
+  clientLead ClientLead?
+
+  // Partial unique index "lead_assignments_one_active" (lead) WHERE status='ACTIVE' lives in SQL migration.
+  @@index([leadId, status])
+  @@index([organizationId, status, assignedAt])
+  @@index([batchId])
+  @@index([assignedAt])
+  @@index([leadId, organizationId], map: "lead_assignments_lead_org_idx")
+  @@map("lead_assignments")
+}
+
+model DistributionRule {
+  id              String               @id @default(cuid())
+  name            String
+  description     String?
+  strategy        DistributionStrategy
+  enabled         Boolean              @default(false)
+  trigger         String               @default("MANUAL") // MANUAL | SCHEDULED | ON_IMPORT
+  intervalMinutes Int?
+  // { filter: LeadFilter, targets: [{organizationId, weight}], maxPerRun, onlyUnallocated }
+  config          Json
+  version         Int                  @default(1)
+  lastRunAt       DateTime?
+  lastBatchId     String?
+  createdById     String
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  @@map("distribution_rules")
+}
+
+// ─────────────────────── Client CRM (tenant) ───────────────────────
+
+model ClientLead {
+  id                String           @id @default(cuid())
+  organizationId    String
+  organization      Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  leadId            String
+  assignmentId      String           @unique
+  assignment        LeadAssignment   @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  // Working copy of contact details (client-editable, never written back to master).
+  fullName          String
+  email             String?
+  phone             String?
+  secondaryPhone    String?
+  company           String?
+  jobTitle          String?
+  country           String?
+  state             String?
+  city              String?
+  industry          String?
+  // Attribution snapshot — read-only for clients.
+  source            String?
+  campaign          String?
+  score             Int              @default(0)
+  priority          Priority         @default(MEDIUM)
+  status            ClientLeadStatus @default(NEW)
+  ownerId           String?
+  owner             User?            @relation("ClientLeadOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  teamId            String?
+  pipelineId        String?
+  stageId           String?
+  stage             PipelineStage?   @relation(fields: [stageId], references: [id], onDelete: SetNull)
+  stageEnteredAt    DateTime?
+  dealValue         Decimal?         @db.Decimal(14, 2)
+  currency          String           @default("USD")
+  expectedCloseDate DateTime?
+  probability       Int?
+  lostReason        String?
+  customFields      Json             @default("{}")
+  firstContactAt    DateTime?
+  lastActivityAt    DateTime?
+  nextFollowUpAt    DateTime?
+  convertedAt       DateTime?
+  lostAt            DateTime?
+  archivedAt        DateTime?
+  revokedAt         DateTime? // assignment ended → hidden from tenant
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  notes       Note[]
+  tasks       Task[]
+  comms       CommunicationLog[]
+  attachments Attachment[]
+  tags        ClientLeadTag[]
+
+  @@index([organizationId, revokedAt, archivedAt, status])
+  @@index([organizationId, ownerId])
+  @@index([organizationId, stageId])
+  @@index([organizationId, nextFollowUpAt])
+  @@index([organizationId, createdAt])
+  @@index([leadId])
+  @@index([fullName(ops: raw("gin_trgm_ops"))], type: Gin, map: "client_leads_fullname_trgm")
+  @@index([company(ops: raw("gin_trgm_ops"))], type: Gin, map: "client_leads_company_trgm")
+  @@map("client_leads")
+}
+
+model ClientLeadTag {
+  clientLeadId   String
+  tagId          String
+  organizationId String
+  clientLead     ClientLead @relation(fields: [clientLeadId], references: [id], onDelete: Cascade)
+  tag            Tag        @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([clientLeadId, tagId])
+  @@map("client_lead_tags")
+}
+
+model Pipeline {
+  id             String          @id @default(cuid())
+  organizationId String
+  name           String
+  isDefault      Boolean         @default(false)
+  createdAt      DateTime        @default(now())
+  stages         PipelineStage[]
+
+  @@index([organizationId])
+  @@map("pipelines")
+}
+
+model PipelineStage {
+  id                String        @id @default(cuid())
+  organizationId    String
+  pipelineId        String
+  pipeline          Pipeline      @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  name              String
+  position          Int
+  category          StageCategory @default(OPEN)
+  probability       Int           @default(0)
+  stagnantAfterDays Int?
+  requiresApproval  Boolean       @default(false)
+  createdAt         DateTime      @default(now())
+
+  clientLeads ClientLead[]
+
+  @@index([pipelineId, position])
+  @@map("pipeline_stages")
+}
+
+model StageHistory {
+  id             String   @id @default(cuid())
+  organizationId String
+  clientLeadId   String
+  fromStageId    String?
+  toStageId      String
+  changedById    String?
+  durationMs     BigInt?
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId, clientLeadId, createdAt])
+  @@map("stage_history")
+}
+
+// Lead lifecycle & tracking events. organizationId null → platform-side event.
+model Activity {
+  id             String               @id @default(cuid())
+  organizationId String?
+  leadId         String?
+  clientLeadId   String?
+  actorId        String?
+  type           String // LEAD_ASSIGNED | LEAD_VIEWED | FIELD_REVEALED | ...
+  verification   ActivityVerification @default(SYSTEM_VERIFIED)
+  summary        String
+  data           Json                 @default("{}")
+  createdAt      DateTime             @default(now())
+
+  @@index([clientLeadId, createdAt])
+  @@index([leadId, createdAt])
+  @@index([organizationId, createdAt])
+  @@index([actorId, type, createdAt])
+  @@index([type, createdAt])
+  @@map("lead_activities")
+}
+
+model Note {
+  id             String     @id @default(cuid())
+  organizationId String
+  clientLeadId   String
+  clientLead     ClientLead @relation(fields: [clientLeadId], references: [id], onDelete: Cascade)
+  authorId       String
+  body           String
+  pinned         Boolean    @default(false)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+  deletedAt      DateTime?
+
+  @@index([organizationId, clientLeadId, createdAt])
+  @@map("lead_notes")
+}
+
+model Attachment {
+  id             String     @id @default(cuid())
+  organizationId String
+  clientLeadId   String
+  clientLead     ClientLead @relation(fields: [clientLeadId], references: [id], onDelete: Cascade)
+  uploadedById   String
+  fileName       String
+  mimeType       String
+  size           Int
+  sha256         String
+  storageKey     String
+  createdAt      DateTime   @default(now())
+  deletedAt      DateTime?
+
+  @@index([organizationId, clientLeadId])
+  @@map("lead_attachments")
+}
+
+model Task {
+  id                String      @id @default(cuid())
+  organizationId    String
+  clientLeadId      String?
+  clientLead        ClientLead? @relation(fields: [clientLeadId], references: [id], onDelete: Cascade)
+  title             String
+  description       String?
+  type              TaskType    @default(TODO)
+  priority          Priority    @default(MEDIUM)
+  status            TaskStatus  @default(OPEN)
+  dueAt             DateTime?
+  reminderAt        DateTime?
+  assigneeId        String?
+  assignee          User?       @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  createdById       String
+  delegatedById     String?
+  recurrence        Recurrence  @default(NONE)
+  parentTaskId      String?
+  completedAt       DateTime?
+  completedById     String?
+  completionNote    String?
+  escalatedAt       DateTime?
+  overdueNotifiedAt DateTime?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  @@index([organizationId, assigneeId, status, dueAt])
+  @@index([organizationId, clientLeadId])
+  @@index([organizationId, status, dueAt])
+  @@map("tasks")
+}
+
+model CommunicationLog {
+  id                String               @id @default(cuid())
+  organizationId    String
+  clientLeadId      String
+  clientLead        ClientLead           @relation(fields: [clientLeadId], references: [id], onDelete: Cascade)
+  userId            String
+  channel           CommChannel
+  direction         CommDirection        @default(OUTBOUND)
+  outcome           String // CONNECTED | NO_ANSWER | VOICEMAIL | BUSY | WRONG_NUMBER | SENT | REPLIED | BOUNCED | HELD | NO_SHOW
+  durationSec       Int?
+  subject           String?
+  body              String?
+  occurredAt        DateTime             @default(now())
+  verification      ActivityVerification @default(SELF_REPORTED)
+  provider          String?
+  providerMessageId String?
+  createdAt         DateTime             @default(now())
+
+  @@index([organizationId, clientLeadId, occurredAt])
+  @@index([organizationId, userId, occurredAt])
+  @@map("communication_logs")
+}
+
+model CommunicationTemplate {
+  id             String      @id @default(cuid())
+  organizationId String
+  channel        CommChannel
+  name           String
+  subject        String?
+  body           String
+  createdById    String
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@unique([organizationId, name])
+  @@map("communication_templates")
+}
+
+model ConsentRecord {
+  id             String        @id @default(cuid())
+  organizationId String
+  clientLeadId   String
+  channel        CommChannel
+  status         ConsentStatus
+  source         String?
+  note           String?
+  recordedById   String
+  createdAt      DateTime      @default(now())
+
+  @@index([organizationId, clientLeadId, channel, createdAt])
+  @@map("consent_records")
+}
+
+model Team {
+  id             String       @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  managerId      String?
+  createdAt      DateTime     @default(now())
+  members        TeamMember[]
+
+  @@unique([organizationId, name])
+  @@map("teams")
+}
+
+model TeamMember {
+  teamId         String
+  userId         String
+  organizationId String
+  team           Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt      DateTime @default(now())
+
+  @@id([teamId, userId])
+  @@map("team_members")
+}
+
+model UserTarget {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  period         String // YYYY-MM
+  metric         String // CONTACTS | CONVERSIONS | PIPELINE_VALUE
+  target         Int
+  createdById    String
+  createdAt      DateTime @default(now())
+
+  @@unique([organizationId, userId, period, metric])
+  @@map("user_targets")
+}
+
+// ─────────────────────── Platform services ───────────────────────
+
+model Notification {
+  id             String    @id @default(cuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId String?
+  type           String
+  title          String
+  body           String?
+  link           String?
+  dedupeKey      String?   @unique
+  readAt         DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([userId, readAt, createdAt])
+  @@map("notifications")
+}
+
+model OutboundEmail {
+  id        String      @id @default(cuid())
+  to        String
+  subject   String
+  body      String
+  status    EmailStatus @default(QUEUED)
+  provider  String?
+  error     String?
+  createdAt DateTime    @default(now())
+  sentAt    DateTime?
+
+  @@index([createdAt])
+  @@map("outbound_emails")
+}
+
+model WorkflowDefinition {
+  id             String   @id @default(cuid())
+  organizationId String? // null → platform workflow (applies to all tenants)
+  name           String
+  description    String?
+  trigger        String // LEAD_ASSIGNED_NO_CONTACT | TASK_OVERDUE | STAGE_STAGNANT | LEAD_UNTOUCHED
+  conditions     Json     @default("{}")
+  actions        Json     @default("[]")
+  graph          Json? // canvas graph {nodes, edges}; when present it is the source of truth for execution
+  enabled        Boolean  @default(false)
+  testMode       Boolean  @default(true)
+  version        Int      @default(1)
+  maxAttempts    Int      @default(3)
+  createdById    String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  executions WorkflowExecution[]
+
+  @@map("workflow_definitions")
+}
+
+model WorkflowExecution {
+  id          String             @id @default(cuid())
+  workflowId  String
+  workflow    WorkflowDefinition @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  version     Int
+  subjectType String
+  subjectId   String
+  dedupeKey   String             @unique
+  status      ExecutionStatus    @default(PENDING)
+  testMode    Boolean            @default(false)
+  attempts    Int                @default(0)
+  result      Json?
+  error       String?
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  createdAt   DateTime           @default(now())
+
+  @@index([workflowId, createdAt])
+  @@index([status])
+  @@map("workflow_executions")
+}
+
+// Append-only + hash-chained via DB trigger (see migration *_audit). Never UPDATE/DELETE from app code.
+model AuditEvent {
+  id             String      @id @default(cuid())
+  seq            BigInt      @unique @default(autoincrement())
+  actorId        String?
+  actorEmail     String?
+  actorRole      String?
+  organizationId String?
+  action         String
+  targetType     String?
+  targetId       String?
+  result         AuditResult @default(SUCCESS)
+  reason         String?
+  before         Json?
+  after          Json?
+  metadata       Json?
+  requestId      String?
+  sessionId      String?
+  ip             String?
+  userAgent      String?
+  prevHash       String?
+  hash           String?
+  createdAt      DateTime    @default(now())
+
+  @@index([createdAt])
+  @@index([organizationId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+  @@index([targetType, targetId])
+  @@map("audit_events")
+}
+
+model SecurityAlert {
+  id             String        @id @default(cuid())
+  type           String
+  severity       AlertSeverity
+  status         AlertStatus   @default(OPEN)
+  title          String
+  details        Json          @default("{}")
+  userId         String?
+  organizationId String?
+  ip             String?
+  dedupeKey      String?       @unique
+  assigneeId     String?
+  resolutionNote String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  resolvedAt     DateTime?
+
+  notes SecurityAlertNote[]
+
+  @@index([status, severity, createdAt])
+  @@map("security_alerts")
+}
+
+model SecurityAlertNote {
+  id        String        @id @default(cuid())
+  alertId   String
+  alert     SecurityAlert @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  authorId  String
+  body      String
+  createdAt DateTime      @default(now())
+
+  @@map("security_alert_notes")
+}
+
+model PlatformSetting {
+  key         String   @id
+  value       Json
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+
+  @@map("platform_settings")
+}
+
+model IntegrationConfig {
+  id             String   @id @default(cuid())
+  organizationId String?
+  provider       String // SMTP | TWILIO_SMS | WHATSAPP_BUSINESS | AI_SCORING
+  enabled        Boolean  @default(false)
+  config         Json     @default("{}") // non-secret settings only; secrets come from env
+  createdById    String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([organizationId, provider])
+  @@map("integration_configs")
+}
+
+model SavedView {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organizationId String?
+  scope          String // ADMIN_LEADS | CLIENT_LEADS | ADMIN_DASHBOARD | AUDIT | REPORT
+  name           String
+  state          Json
+  createdAt      DateTime @default(now())
+
+  @@unique([userId, scope, name])
+  @@map("saved_views")
+}
+
+model SavedReport {
+  id             String    @id @default(cuid())
+  ownerId        String
+  organizationId String?
+  name           String
+  definition     Json // { metric, groupBy, filters, range }
+  schedule       String? // DAILY | WEEKLY | MONTHLY
+  recipients     String[]  @default([])
+  lastRunAt      DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@map("saved_reports")
+}
+
+// Single-row chain head for the audit hash chain. Managed exclusively by the
+// audit_events_chain() trigger — application code must not write to it.
+model AuditChainHead {
+  id       Int     @id
+  lastHash String? @map("last_hash")
+  lastSeq  BigInt  @default(0) @map("last_seq")
+
+  @@map("audit_chain_head")
+}
+
+// ─────────────────────────────── Email ───────────────────────────────
+
+enum EmailStatus2 {
+  QUEUED
+  SENDING
+  SENT
+  FAILED
+  SKIPPED
+  CANCELLED
+}
+
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  QUEUED
+  SENDING
+  COMPLETED
+  PARTIAL
+  FAILED
+  CANCELLED
+}
+
+/// SMTP sender accounts. organizationId null → platform account. Passwords are AES-256-GCM encrypted and never returned by the API.
+model SmtpAccount {
+  id                String    @id @default(cuid())
+  organizationId    String?
+  label             String
+  host              String
+  port              Int
+  secure            Boolean   @default(true)
+  username          String
+  passwordEnc       String
+  fromName          String
+  fromEmail         String
+  replyTo           String?
+  dailyLimit        Int       @default(500)
+  perMinuteLimit    Int       @default(30)
+  isDefault         Boolean   @default(false)
+  status            String    @default("UNVERIFIED") // UNVERIFIED | VERIFIED | FAILED
+  lastVerifiedAt    DateTime?
+  lastError         String?
+  /// DKIM signing with the From domain (key generated here; public key published in DNS).
+  dkimSelector      String?
+  dkimPrivateKeyEnc String?
+  dkimPublicKey     String?
+  dkimEnabled       Boolean   @default(false)
+  /// Last deliverability (SPF/DKIM/DMARC/MX…) check result.
+  deliverability    Json?
+  deliverabilityAt  DateTime?
+  createdById       String
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime?
+
+  @@index([organizationId])
+  @@map("smtp_accounts")
+}
+
+model EmailTemplate {
+  id             String    @id @default(cuid())
+  organizationId String?
+  name           String
+  category       String?
+  subject        String
+  preheader      String?
+  design         Json // block document rendered by src/lib/email/render.ts
+  html           String
+  text           String
+  createdById    String
+  updatedById    String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  archivedAt     DateTime?
+
+  @@index([organizationId, archivedAt])
+  @@map("email_templates")
+}
+
+model EmailCampaign {
+  id              String         @id @default(cuid())
+  organizationId  String?
+  name            String
+  smtpAccountId   String
+  templateId      String?
+  subject         String
+  preheader       String?
+  design          Json
+  status          CampaignStatus @default(QUEUED)
+  audience        Json // selection snapshot
+  trackOpens      Boolean        @default(true)
+  scheduledFor    DateTime?
+  totalRecipients Int            @default(0)
+  sentCount       Int            @default(0)
+  failedCount     Int            @default(0)
+  skippedCount    Int            @default(0)
+  openedCount     Int            @default(0)
+  error           String?
+  createdById     String
+  createdAt       DateTime       @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
+
+  messages EmailMessage[]
+
+  @@index([organizationId, createdAt])
+  @@map("email_campaigns")
+}
+
+model EmailMessage {
+  id                String         @id @default(cuid())
+  organizationId    String?
+  campaignId        String?
+  campaign          EmailCampaign? @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  smtpAccountId     String
+  leadId            String?
+  clientLeadId      String?
+  toEmail           String
+  toName            String?
+  subject           String
+  status            EmailStatus2   @default(QUEUED)
+  error             String?
+  attempts          Int            @default(0)
+  providerMessageId String?
+  trackingToken     String         @unique
+  queuedAt          DateTime       @default(now())
+  sentAt            DateTime?
+  openedAt          DateTime?
+  openCount         Int            @default(0)
+  createdAt         DateTime       @default(now())
+  // Email endpoints (triggered sends): which endpoint/trigger/step produced this message.
+  endpointId        String?
+  endpointEventId   String?
+  stepIndex         Int?
+  scheduledFor      DateTime?
+  /// Template variables for endpoint messages (purged after the endpoint's retention period).
+  vars              Json?
+  cc                String[]       @default([])
+  bcc               String[]       @default([])
+  clickCount        Int            @default(0)
+  clickedAt         DateTime?
+
+  events EmailMessageEvent[]
+
+  @@index([campaignId, status])
+  @@index([organizationId, createdAt])
+  @@index([clientLeadId])
+  @@index([smtpAccountId, sentAt])
+  @@index([endpointId, createdAt])
+  @@index([toEmail])
+  @@map("email_messages")
+}
+
+/// Per-message delivery timeline: queued, deferred, sent, failed, opened, clicked, unsubscribed…
+model EmailMessageEvent {
+  id        String       @id @default(cuid())
+  messageId String
+  message   EmailMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  type      String
+  detail    String?
+  url       String?
+  ip        String?
+  userAgent String?
+  createdAt DateTime     @default(now())
+
+  @@index([messageId, createdAt])
+  @@index([type, createdAt])
+  @@map("email_message_events")
+}
+
+/// A named email trigger: a platform event or an inbound webhook, with the emails attached to it.
+model EmailEndpoint {
+  id               String    @id @default(cuid())
+  name             String
+  slug             String    @unique
+  description      String?
+  status           String    @default("ACTIVE") // ACTIVE | PAUSED
+  triggerType      String // EVENT | WEBHOOK
+  event            String?
+  tokenHash        String?   @unique
+  tokenPreview     String?
+  signingSecretEnc String?
+  category         String    @default("TRANSACTIONAL") // TRANSACTIONAL | MARKETING
+  smtpAccountId    String?
+  /// Recipients, conditions, attached emails and delivery options (validated by the endpoint schema).
+  config           Json
+  lastTriggeredAt  DateTime?
+  createdById      String
+  updatedById      String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  deletedAt        DateTime?
+
+  events EmailEndpointEvent[]
+
+  @@index([triggerType, event, status])
+  @@map("email_endpoints")
+}
+
+/// One trigger of an endpoint (an event fired or a webhook call) and what came of it.
+model EmailEndpointEvent {
+  id             String        @id @default(cuid())
+  endpointId     String
+  endpoint       EmailEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  source         String // EVENT | WEBHOOK | TEST | REPLAY
+  status         String // ACCEPTED | FILTERED | DUPLICATE | THROTTLED | PAUSED | NO_RECIPIENTS
+  reason         String?
+  idempotencyKey String?
+  payload        Json?
+  recipients     Int           @default(0)
+  messages       Int           @default(0)
+  ip             String?
+  replayOfId     String?
+  createdAt      DateTime      @default(now())
+
+  @@unique([endpointId, idempotencyKey])
+  @@index([endpointId, createdAt])
+  @@map("email_endpoint_events")
+}
+
+/// Addresses that must not be emailed (unsubscribed, bounced, manual). Stored as SHA-256 of the normalized address.
+model EmailSuppression {
+  id             String   @id @default(cuid())
+  organizationId String?
+  emailHash      String
+  reason         String // UNSUBSCRIBED | BOUNCED | MANUAL
+  createdAt      DateTime @default(now())
+
+  @@unique([organizationId, emailHash])
+  @@map("email_suppressions")
+}
+
+// ── Lead marketplace & announcements ─────────────────────────────────
+
+enum LeadRequestStatus {
+  PENDING
+  FULFILLED
+  PARTIAL
+  REJECTED
+  CANCELLED
+}
+
+enum BillingStatus {
+  NONE // nothing to pay (free demo leads only)
+  DUE
+  PAID
+  WAIVED
+  VOID
+}
+
+/// A client's request to receive specific marketplace leads, with its price quote and billing state.
+model LeadRequest {
+  id             String            @id @default(cuid())
+  code           String            @unique
+  organizationId String
+  requestedById  String
+  status         LeadRequestStatus @default(PENDING)
+  note           String?
+  adminNote      String?
+  leadCount      Int
+  deliveredCount Int               @default(0)
+  freeApplied    Int               @default(0)
+  currency       String            @default("USD")
+  subtotal       Decimal           @default(0) @db.Decimal(12, 2)
+  discount       Decimal           @default(0) @db.Decimal(12, 2)
+  tax            Decimal           @default(0) @db.Decimal(12, 2)
+  total          Decimal           @default(0) @db.Decimal(12, 2)
+  quote          Json // price lines, rules applied, volume tier
+  billingStatus  BillingStatus     @default(NONE)
+  /// INVOICE (billed after delivery) or CREDITS (prepaid credits held at request, settled on delivery).
+  paymentMethod  String            @default("INVOICE")
+  creditsCharged Int               @default(0)
+  couponId       String?
+  couponCode     String?
+  couponDiscount Decimal           @default(0) @db.Decimal(12, 2)
+  invoiceNumber  String?           @unique
+  paidAt         DateTime?
+  batchId        String?
+  decidedById    String?
+  decidedAt      DateTime?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  items LeadRequestItem[]
+
+  @@index([organizationId, createdAt])
+  @@index([status, createdAt])
+  @@map("lead_requests")
+}
+
+model LeadRequestItem {
+  id             String      @id @default(cuid())
+  requestId      String
+  request        LeadRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  organizationId String
+  leadId         String
+  price          Decimal     @db.Decimal(12, 2)
+  free           Boolean     @default(false)
+  status         String      @default("REQUESTED") // REQUESTED | DELIVERED | UNAVAILABLE | RELEASED
+
+  @@unique([requestId, leadId])
+  @@index([leadId])
+  @@index([organizationId])
+  @@map("lead_request_items")
+}
+
+/// Broadcast notifications sent by the platform to client dashboards (manual or automatic).
+model Announcement {
+  id             String   @id @default(cuid())
+  kind           String // MANUAL | NEW_LEADS
+  title          String
+  body           String?
+  link           String?
+  audience       Json // { scope: 'ALL' | 'ORGS', organizationIds?: string[], includePlatform?: boolean }
+  recipientCount Int      @default(0)
+  orgCount       Int      @default(0)
+  createdById    String?
+  createdAt      DateTime @default(now())
+
+  @@index([createdAt])
+  @@map("announcements")
+}
+
+enum CouponType {
+  PERCENT // % off the paid subtotal
+  FIXED // fixed amount off
+  FREE_LEADS // extra free leads in the request
+}
+
+/// Discount codes created by the platform. Visible coupons are offered on client dashboards.
+model Coupon {
+  id               String     @id @default(cuid())
+  code             String     @unique
+  name             String
+  description      String?
+  type             CouponType
+  value            Decimal    @db.Decimal(12, 2)
+  maxDiscount      Decimal?   @db.Decimal(12, 2)
+  minLeads         Int        @default(0)
+  minSubtotal      Decimal    @default(0) @db.Decimal(12, 2)
+  startsAt         DateTime?
+  endsAt           DateTime?
+  maxRedemptions   Int? // across all clients
+  perClientLimit   Int        @default(1)
+  organizationIds  String[]   @default([]) // empty = every client
+  visibleToClients Boolean    @default(true)
+  firstRequestOnly Boolean    @default(false)
+  active           Boolean    @default(true)
+  createdById      String
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  redemptions CouponRedemption[]
+
+  @@map("coupons")
+}
+
+model CouponRedemption {
+  id             String   @id @default(cuid())
+  couponId       String
+  coupon         Coupon   @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  organizationId String
+  requestId      String   @unique
+  discount       Decimal  @default(0) @db.Decimal(12, 2)
+  extraFreeLeads Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  @@index([couponId])
+  @@index([organizationId, couponId])
+  @@map("coupon_redemptions")
+}
+
+// ── Funnels (client workspaces) ──────────────────────────────────────
+
+/// A client-defined funnel: an ordered set of stages, each defined by lead filter conditions.
+model Funnel {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  status         String   @default("ACTIVE") // ACTIVE | PAUSED | ARCHIVED
+  baseFilter     Json     @default("{\"conditions\":[]}")
+  stages         Json // [{ id, name, description?, conditions[], automation? }]
+  goal           String?
+  createdById    String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  campaigns   FunnelCampaign[]
+  enrollments FunnelEnrollment[]
+
+  @@index([organizationId, status])
+  @@map("funnels")
+}
+
+/// A campaign launched against a funnel stage (one-off or by a stage automation).
+model FunnelCampaign {
+  id              String   @id @default(cuid())
+  organizationId  String
+  funnelId        String
+  funnel          Funnel   @relation(fields: [funnelId], references: [id], onDelete: Cascade)
+  stageId         String
+  stageName       String
+  scope           String // CURRENT | REACHED
+  channel         String // EMAIL | TASK | NOTIFY
+  name            String
+  automated       Boolean  @default(false)
+  emailCampaignId String?
+  recipients      Int      @default(0)
+  skipped         Int      @default(0)
+  details         Json?
+  createdById     String
+  createdAt       DateTime @default(now())
+
+  @@index([organizationId, funnelId, createdAt])
+  @@map("funnel_campaigns")
+}
+
+/// Tracks which leads a stage automation has already acted on (each lead once per stage).
+model FunnelEnrollment {
+  id             String   @id @default(cuid())
+  organizationId String
+  funnelId       String
+  funnel         Funnel   @relation(fields: [funnelId], references: [id], onDelete: Cascade)
+  stageId        String
+  clientLeadId   String
+  enteredAt      DateTime @default(now())
+  result         String?
+
+  @@unique([funnelId, stageId, clientLeadId])
+  @@index([organizationId])
+  @@map("funnel_enrollments")
+}
+
+// ── Business onboarding forms (platform) ─────────────────────────────
+
+model OnboardingForm {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  status      String   @default("DRAFT") // DRAFT | PUBLISHED | CLOSED
+  config      Json // fields, steps, design, content, settings
+  assets      Json     @default("{}") // { logo?, cover? } uploaded images
+  views       Int      @default(0)
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  applications OnboardingApplication[]
+
+  @@map("onboarding_forms")
+}
+
+model OnboardingApplication {
+  id             String         @id @default(cuid())
+  formId         String
+  form           OnboardingForm @relation(fields: [formId], references: [id], onDelete: Cascade)
+  status         String         @default("PENDING") // PENDING | APPROVED | REJECTED | SPAM
+  businessName   String
+  contactName    String
+  email          String
+  phone          String?
+  website        String?
+  industry       String?
+  country        String?
+  answers        Json
+  leadInterests  Json?
+  flags          String[]       @default([])
+  quality        Int            @default(0)
+  ip             String?
+  userAgent      String?
+  organizationId String?
+  decidedById    String?
+  decidedAt      DateTime?
+  reason         String?
+  notes          String?
+  createdAt      DateTime       @default(now())
+
+  @@index([formId, createdAt])
+  @@index([status, createdAt])
+  @@index([email])
+  @@map("onboarding_applications")
+}
+
+enum EnrichmentStatus {
+  QUEUED
+  RUNNING
+  DONE
+  PARTIAL
+  FAILED
+  SKIPPED
+}
+
+/// AI enrichment of a master lead: verified public company facts with sources and confidence.
+model LeadEnrichment {
+  id            String           @id @default(cuid())
+  leadId        String           @unique
+  lead          Lead             @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  status        EnrichmentStatus @default(QUEUED)
+  engine        String?
+  domain        String?
+  confidence    Int              @default(0)
+  /// { field: { value, confidence, source } }
+  data          Json             @default("{}")
+  summary       String?
+  sources       Json             @default("[]")
+  /// Deterministic checks: email syntax / MX / free / disposable, phone validity and type.
+  checks        Json             @default("{}")
+  applied       String[]         @default([])
+  /// Lower-cased industry, keywords and description — what the Lead Finder searches.
+  searchText    String?
+  error         String?
+  attempts      Int              @default(0)
+  applyMode     String           @default("empty")
+  batchId       String?
+  requestedById String?
+  queuedAt      DateTime         @default(now())
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  updatedAt     DateTime         @updatedAt
+
+  @@index([status])
+  @@index([batchId])
+  @@index([domain])
+  @@index([searchText(ops: raw("gin_trgm_ops"))], type: Gin, map: "lead_enrichments_search_trgm")
+  @@map("lead_enrichments")
+}
+
+/// Per-domain crawl cache so leads from the same company are researched once.
+model DomainSnapshot {
+  domain    String   @id
+  status    String
+  data      Json     @default("{}")
+  text      String?
+  pages     Json     @default("[]")
+  fetchedAt DateTime @default(now())
+
+  @@index([fetchedAt])
+  @@map("domain_snapshots")
+}
+
+/// Company registry facts (MCA via Falcon eBiz / OpenCorporates / CIN on the company site), fetched once per company.
+/// Director names and contact details from providers are never stored.
+model CompanyRegistryRecord {
+  id        String   @id @default(cuid())
+  /// CIN / LLPIN / registry number when known.
+  regId     String?  @unique
+  /// Normalised company name, for name lookups.
+  nameKey   String
+  source    String
+  data      Json     @default("{}")
+  fetchedAt DateTime @default(now())
+
+  @@index([nameKey])
+  @@map("company_registry_records")
+}
+
+// ── Lead credits ────────────────────────────────────────────────────
+
+enum CreditEntryType {
+  PURCHASE // credits bought through a completed credit request
+  BONUS // bonus credits on a purchase
+  WELCOME // credits granted when a workspace's wallet opens
+  GRANT // credits added by the platform team
+  SPEND // credits used to buy leads
+  REFUND // credits returned (undelivered leads, rejected or cancelled requests)
+  ADJUSTMENT // credits removed by the platform team
+  EXPIRY // credits that passed their expiry date
+}
+
+enum CreditRequestStatus {
+  PENDING // submitted by the client
+  AWAITING_PAYMENT // payment details sent, waiting for the money
+  COMPLETED // payment received, credits added
+  REJECTED
+  CANCELLED
+}
+
+/// A workspace's credit balance (the ledger in credit_entries is the source of truth; this row is its running total).
+model CreditWallet {
+  organizationId       String    @id
+  balance              Int       @default(0)
+  lifetimeIn           Int       @default(0)
+  lifetimeSpent        Int       @default(0)
+  lowBalanceNotifiedAt DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@map("credit_wallets")
+}
+
+/// Append-only credit ledger. Positive entries are "lots" that are consumed oldest-expiry first (`remaining`).
+model CreditEntry {
+  id              String          @id @default(cuid())
+  organizationId  String
+  type            CreditEntryType
+  credits         Int // signed
+  balanceAfter    Int
+  remaining       Int? // lots only: credits of this entry not yet used or expired
+  expiresAt       DateTime?
+  leadRequestId   String?
+  creditRequestId String?
+  note            String?
+  /// SPEND / ADJUSTMENT / EXPIRY: which lots were consumed [{ id, credits }].
+  allocations     Json?
+  actorId         String?
+  createdAt       DateTime        @default(now())
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, remaining, expiresAt])
+  @@index([leadRequestId])
+  @@index([creditRequestId])
+  @@index([type, createdAt])
+  @@map("credit_entries")
+}
+
+/// A client's request to buy credits; the platform team confirms payment and the credits are added.
+model CreditRequest {
+  id               String              @id @default(cuid())
+  code             String              @unique
+  organizationId   String
+  requestedById    String
+  packageId        String?
+  packageName      String?
+  credits          Int
+  bonusCredits     Int                 @default(0)
+  currency         String
+  amount           Decimal             @db.Decimal(12, 2)
+  tax              Decimal             @default(0) @db.Decimal(12, 2)
+  total            Decimal             @db.Decimal(12, 2)
+  status           CreditRequestStatus @default(PENDING)
+  clientNote       String?
+  adminNote        String?
+  /// Sent to the client when awaiting payment (bank / UPI details, payment link…).
+  paymentDetails   String?
+  /// The client's payment reference (UTR, transaction id…).
+  clientReference  String?
+  paymentMethod    String?
+  paymentReference String?
+  invoiceNumber    String?             @unique
+  paidAt           DateTime?
+  decidedById      String?
+  decidedAt        DateTime?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  @@index([organizationId, createdAt])
+  @@index([status, createdAt])
+  @@map("credit_requests")
+}
+
+// ── Client growth features ──────────────────────────────────────────
+
+/// A saved marketplace filter: alerts on new matching leads and, optionally, buys them automatically.
+model SavedSearch {
+  id                String    @id @default(cuid())
+  organizationId    String
+  createdById       String
+  name              String
+  /// Marketplace filter (client-safe conditions only).
+  filter            Json
+  alertInApp        Boolean   @default(true)
+  alertEmail        Boolean   @default(false)
+  /// Auto-buy: request new matches paid with credits, within limits.
+  autoBuy           Boolean   @default(false)
+  autoBuyMaxPerWeek Int       @default(10)
+  autoBuyMaxPrice   Decimal?  @db.Decimal(12, 2)
+  active            Boolean   @default(true)
+  /// Newest lead seen by the last check — later leads are "new".
+  cursorAt          DateTime  @default(now())
+  lastCheckedAt     DateTime?
+  lastMatchCount    Int       @default(0)
+  lastAlertAt       DateTime?
+  lastAutoBuyAt     DateTime?
+  totalAutoBought   Int       @default(0)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([organizationId])
+  @@index([active])
+  @@map("saved_searches")
+}
+
+/// A lead a client user has shortlisted in the marketplace.
+model MarketWatch {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  leadId         String
+  note           String?
+  createdAt      DateTime @default(now())
+
+  @@unique([userId, leadId])
+  @@index([organizationId, userId])
+  @@map("market_watches")
+}
+
+enum DisputeStatus {
+  OPEN
+  APPROVED
+  REJECTED
+}
+
+/// "Lead quality guarantee": a client reports a bad purchased lead; approved reports are refunded in credits.
+model LeadDispute {
+  id             String        @id @default(cuid())
+  code           String        @unique
+  organizationId String
+  clientLeadId   String
+  leadId         String
+  leadRequestId  String?
+  reportedById   String
+  reason         String // WRONG_NUMBER | BOUNCED_EMAIL | CLOSED_BUSINESS | DUPLICATE | WRONG_PERSON | OTHER
+  details        String?
+  status         DisputeStatus @default(OPEN)
+  /// What was paid for this lead (marketplace currency) and how many credits it cost, if any.
+  paidAmount     Decimal       @default(0) @db.Decimal(12, 2)
+  paidCredits    Int           @default(0)
+  refundCredits  Int           @default(0)
+  resolution     String?
+  autoDecided    Boolean       @default(false)
+  decidedById    String?
+  decidedAt      DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@unique([clientLeadId])
+  @@index([organizationId, createdAt])
+  @@index([status, createdAt])
+  @@index([leadId])
+  @@map("lead_disputes")
+}
+
+/// Every webhook call a workspace's integrations received (for retries and troubleshooting).
+model WebhookDelivery {
+  id             String    @id @default(cuid())
+  organizationId String
+  url            String
+  event          String
+  payload        Json
+  status         String    @default("PENDING") // PENDING | DELIVERED | FAILED
+  attempts       Int       @default(0)
+  responseCode   Int?
+  error          String?
+  deliveredAt    DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([organizationId, createdAt])
+  @@index([status, createdAt])
+  @@map("webhook_deliveries")
+}
+
+/// A workspace's referral code, and the workspaces that joined with it.
+model ReferralCode {
+  organizationId String   @id
+  code           String   @unique
+  createdAt      DateTime @default(now())
+
+  @@map("referral_codes")
+}
+
+model Referral {
+  id            String    @id @default(cuid())
+  referrerOrgId String
+  refereeOrgId  String    @unique
+  code          String
+  status        String    @default("PENDING") // PENDING | REWARDED | VOID
+  rewardedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([referrerOrgId])
+  @@map("referrals")
+}
+
+// ── Super-admin business tools ──────────────────────────────────────
+
+/// Where leads come from. Leads are matched to a supplier by their `source` value.
+model LeadSupplier {
+  id          String   @id @default(cuid())
+  name        String
+  contactName String?
+  email       String?
+  phone       String?
+  /// Lead `source` values that belong to this supplier (case-insensitive).
+  sources     String[]
+  costPerLead Decimal  @default(0) @db.Decimal(12, 2)
+  currency    String   @default("INR")
+  status      String   @default("ACTIVE") // ACTIVE | PAUSED | BLOCKED
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("lead_suppliers")
+}
+
+/// What clients look for in the marketplace (one row per distinct search per user per hour).
+model MarketSearchLog {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  conditions     Json
+  industries     String[]
+  locations      String[]
+  keywords       String[]
+  results        Int
+  createdAt      DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([organizationId, createdAt])
+  @@map("market_search_logs")
+}
+
+/// Super-admin alert rules, checked every 15 minutes.
+model AlertRule {
+  id            String    @id @default(cuid())
+  name          String
+  metric        String // see ALERT_METRICS
+  threshold     Decimal   @db.Decimal(14, 2)
+  /// Optional narrowing, e.g. { industry: "Solar" } for stock alerts.
+  params        Json      @default("{}")
+  cooldownHours Int       @default(24)
+  email         Boolean   @default(false)
+  active        Boolean   @default(true)
+  lastFiredAt   DateTime?
+  createdById   String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  events AlertRuleEvent[]
+
+  @@map("alert_rules")
+}
+
+model AlertRuleEvent {
+  id        String    @id @default(cuid())
+  ruleId    String
+  rule      AlertRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  title     String
+  body      String
+  value     Decimal   @db.Decimal(14, 2)
+  createdAt DateTime  @default(now())
+
+  @@index([ruleId, createdAt])
+  @@index([createdAt])
+  @@map("alert_rule_events")
+}
+
+/// Sequential tax invoices (and credit notes), numbered per financial year.
+model TaxInvoice {
+  id             String   @id @default(cuid())
+  number         String   @unique
+  fy             String // e.g. 2026-27
+  seq            Int
+  kind           String // LEAD_PURCHASE | CREDIT_PURCHASE
+  refId          String // lead request or credit request id
+  organizationId String
+  issuedAt       DateTime @default(now())
+  currency       String
+  /// Snapshots at issue time — invoices never change afterwards.
+  seller         Json
+  buyer          Json
+  lines          Json
+  taxable        Decimal  @db.Decimal(14, 2)
+  cgst           Decimal  @default(0) @db.Decimal(14, 2)
+  sgst           Decimal  @default(0) @db.Decimal(14, 2)
+  igst           Decimal  @default(0) @db.Decimal(14, 2)
+  total          Decimal  @db.Decimal(14, 2)
+  paid           Boolean  @default(false)
+
+  @@unique([fy, seq])
+  @@unique([kind, refId])
+  @@index([organizationId, issuedAt])
+  @@map("tax_invoices")
+}
+
+/// Online payment attempts (Razorpay) for credit purchases.
+model PaymentOrder {
+  id                String    @id @default(cuid())
+  provider          String    @default("razorpay")
+  providerOrderId   String    @unique
+  providerPaymentId String?
+  creditRequestId   String
+  organizationId    String
+  amount            Decimal   @db.Decimal(14, 2)
+  currency          String
+  status            String    @default("CREATED") // CREATED | PAID | FAILED
+  error             String?
+  createdById       String
+  paidAt            DateTime?
+  createdAt         DateTime  @default(now())
+
+  @@index([creditRequestId])
+  @@index([organizationId, createdAt])
+  @@map("payment_orders")
+}
+
+// ── Marketing ───────────────────────────────────────────────────────
+
+/// A saved, always-current group of a workspace's leads (a client-lead filter).
+model MarketingSegment {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  filter         Json
+  createdById    String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([organizationId])
+  @@map("marketing_segments")
+}
+
+/// Multi-step follow-up across email, WhatsApp, SMS and tasks; stops on reply / conversion.
+model Sequence {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  status         String   @default("DRAFT") // DRAFT | ACTIVE | PAUSED
+  /// [{ id, type: email|whatsapp|sms|task, delayHours, templateId?, body?, subject?, title? }]
+  steps          Json
+  stopOnReply    Boolean  @default(true)
+  stopOnStatus   String[] @default(["CONVERTED", "LOST"])
+  /// Enrol new leads of this segment automatically.
+  segmentId      String?
+  autoEnroll     Boolean  @default(false)
+  enrolledCount  Int      @default(0)
+  createdById    String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  enrollments SequenceEnrollment[]
+
+  @@index([organizationId, status])
+  @@map("sequences")
+}
+
+model SequenceEnrollment {
+  id             String    @id @default(cuid())
+  organizationId String
+  sequenceId     String
+  sequence       Sequence  @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  clientLeadId   String
+  stepIndex      Int       @default(0)
+  status         String    @default("ACTIVE") // ACTIVE | COMPLETED | STOPPED | FAILED
+  nextRunAt      DateTime?
+  stopReason     String?
+  lastError      String?
+  enrolledById   String?
+  enrolledAt     DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([sequenceId, clientLeadId])
+  @@index([status, nextRunAt])
+  @@index([organizationId, clientLeadId])
+  @@map("sequence_enrollments")
+}
+
+/// Every WhatsApp / SMS message sent (or attempted) from the platform.
+model MarketingMessage {
+  id                String   @id @default(cuid())
+  organizationId    String
+  clientLeadId      String?
+  channel           String // WHATSAPP | SMS
+  to                String
+  body              String
+  status            String   @default("QUEUED") // QUEUED | SENT | DELIVERED | READ | FAILED | SKIPPED | LOGGED
+  provider          String?
+  providerMessageId String?
+  credits           Int      @default(0)
+  error             String?
+  sequenceId        String?
+  enrollmentId      String?
+  broadcastId       String?
+  sentById          String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([organizationId, createdAt])
+  @@index([providerMessageId])
+  @@index([broadcastId])
+  @@map("marketing_messages")
+}
+
+/// One-off WhatsApp / SMS send to a segment.
+model MarketingBroadcast {
+  id             String    @id @default(cuid())
+  organizationId String
+  name           String
+  channel        String
+  body           String
+  segmentId      String
+  status         String    @default("QUEUED") // PENDING_REVIEW | QUEUED | SENDING | COMPLETED | CANCELLED | REJECTED
+  total          Int       @default(0)
+  sent           Int       @default(0)
+  failed         Int       @default(0)
+  skipped        Int       @default(0)
+  cursor         String?
+  reviewNote     String?
+  createdById    String
+  createdAt      DateTime  @default(now())
+  completedAt    DateTime?
+
+  @@index([organizationId, createdAt])
+  @@index([status])
+  @@map("marketing_broadcasts")
+}
+
+model TrackedLink {
+  id             String    @id @default(cuid())
+  organizationId String
+  code           String    @unique
+  name           String
+  url            String
+  utmSource      String?
+  utmMedium      String?
+  utmCampaign    String?
+  clicks         Int       @default(0)
+  uniqueLeads    Int       @default(0)
+  lastClickAt    DateTime?
+  createdById    String
+  createdAt      DateTime  @default(now())
+
+  @@index([organizationId])
+  @@map("tracked_links")
+}
+
+model LinkClick {
+  id             String   @id @default(cuid())
+  linkId         String
+  organizationId String
+  clientLeadId   String?
+  referer        String?
+  userAgent      String?
+  createdAt      DateTime @default(now())
+
+  @@index([linkId, createdAt])
+  @@index([organizationId, createdAt])
+  @@map("link_clicks")
+}
+
+/// A workspace's own lead-capture form: hosted at /f/<slug> or embedded on their website.
+model CaptureForm {
+  id             String   @id @default(cuid())
+  organizationId String
+  slug           String   @unique
+  name           String
+  /// { title, description, fields: [{ key, label, type, required }], button, thankYou, redirectUrl, consent, accent }
+  config         Json
+  status         String   @default("ACTIVE") // ACTIVE | PAUSED | PENDING_REVIEW | REJECTED
+  sequenceId     String?
+  submissions    Int      @default(0)
+  views          Int      @default(0)
+  reviewNote     String?
+  createdById    String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([organizationId])
+  @@map("capture_forms")
+}
+
+model CaptureSubmission {
+  id             String   @id @default(cuid())
+  organizationId String
+  formId         String
+  clientLeadId   String?
+  data           Json
+  utm            Json?
+  createdAt      DateTime @default(now())
+
+  @@index([formId, createdAt])
+  @@index([organizationId, createdAt])
+  @@map("capture_submissions")
+}
+
+/// Platform template library (sequences and message templates) published to every workspace.
+model MarketingTemplate {
+  id          String   @id @default(cuid())
+  kind        String // SEQUENCE | WHATSAPP | SMS
+  name        String
+  description String?
+  content     Json
+  published   Boolean  @default(true)
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("marketing_templates")
+}

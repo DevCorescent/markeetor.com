@@ -1,26 +1,379 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/* Theme variants follow the app's own theme attribute (user/platform choice), not just the OS. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+@custom-variant light (&:where([data-theme="light"], [data-theme="light"] *));
+
+/*
+ * Monochrome design system with two themes. Dark: black surfaces, white type. Light: warm paper
+ * canvas, white surfaces, ink type. Every component reads these tokens — never raw colours — so
+ * a theme is just a token set. Colour is reserved for meaning (destructive / warning / healthy).
+ * Token blocks also apply to any nested [data-theme] element (used by previews).
+ */
+:root, [data-theme="dark"] {
+  --bg: #050505;
+  --surface: #0b0b0b;
+  --surface-2: #101010;
+  --surface-3: #161616;
+  --hover: #1a1a1a;
+  --border: #1d1d1d;
+  --border-strong: #2a2a2a;
+  --fg: #fafafa;
+  --fg-2: #d4d4d4;
+  --muted: #9a9a9a;
+  --subtle: #6b6b6b;
+  --faint: #3f3f3f;
+  --inverse: #000000;
+  --danger: #f05252;
+  --danger-dim: #2a1212;
+  --warn: #e3b341;
+  --warn-dim: #2a2210;
+  --ok: #4ade80;
+  --ok-dim: #0f2418;
+  /* Accents for categorising (sections, tabs, chips) — never for status. */
+  --info: #6ea8fe;
+  --info-dim: #0f1c33;
+  --accent: #b197fc;
+  --accent-dim: #1e1733;
+  --ring: rgba(255, 255, 255, 0.55);
+  --chart-1: #fafafa;
+  --chart-2: #a3a3a3;
+  --chart-3: #6b6b6b;
+  --chart-4: #404040;
+  --chart-5: #d4d4d4;
+  --chart-6: #525252;
+  --chart-bar: #e5e5e5;
+  --chart-grid: #1a1a1a;
+  --chart-cursor: rgba(255, 255, 255, 0.04);
+  --overlay: rgba(0, 0, 0, 0.7);
+  --shade: #000000;
+  --card-shadow: 0 0 #0000;
+  --raised-shadow: 0 0 #0000;
+  --grid-line: rgba(255, 255, 255, 0.035);
+  --grid-dot: rgba(255, 255, 255, 0.05);
+  --scroll-thumb: #262626;
+  --sel-bg: #ffffff;
+  --sel-fg: #000000;
+  --picker-filter: invert(1);
+  /* Inherited switches: the nearest [data-theme] wins, so nested previews resolve correctly. */
+  --only-dark: block;
+  --only-light: none;
+  color-scheme: dark;
+}
+
+/* Premium light theme: off-white paper, crisp white cards with hairline borders and soft depth. */
+[data-theme="light"] {
+  --bg: #f7f7f5;
+  --surface: #ffffff;
+  --surface-2: #fcfcfb;
+  --surface-3: #f1f1ef;
+  --hover: #ececea;
+  --border: #e8e8e4;
+  --border-strong: #d9d9d4;
+  --fg: #0b0b0b;
+  --fg-2: #262626;
+  --muted: #5b5b57;
+  --subtle: #898984;
+  --faint: #c8c8c2;
+  --inverse: #ffffff;
+  --danger: #cf3328;
+  --danger-dim: #fdeeec;
+  --warn: #9a6400;
+  --warn-dim: #fcf3df;
+  --ok: #137a3a;
+  --ok-dim: #e7f5ec;
+  --info: #1f5fd1;
+  --info-dim: #eaf1fd;
+  --accent: #6b3fd4;
+  --accent-dim: #f2edfd;
+  --ring: rgba(11, 11, 11, 0.45);
+  --chart-1: #0b0b0b;
+  --chart-2: #737373;
+  --chart-3: #a3a3a3;
+  --chart-4: #c4c4c4;
+  --chart-5: #3a3a3a;
+  --chart-6: #d4d4d4;
+  --chart-bar: #171717;
+  --chart-grid: #ededea;
+  --chart-cursor: rgba(0, 0, 0, 0.035);
+  --overlay: rgba(20, 20, 18, 0.28);
+  --shade: rgba(17, 17, 15, 0.14);
+  --card-shadow: 0 1px 2px rgba(17, 17, 15, 0.04), 0 1px 1px rgba(17, 17, 15, 0.02);
+  --raised-shadow: 0 1px 2px rgba(17, 17, 15, 0.05), 0 8px 24px -12px rgba(17, 17, 15, 0.12);
+  --grid-line: rgba(0, 0, 0, 0.045);
+  --grid-dot: rgba(0, 0, 0, 0.09);
+  --scroll-thumb: #d6d6d1;
+  --sel-bg: #0b0b0b;
+  --sel-fg: #ffffff;
+  --picker-filter: none;
+  --only-dark: none;
+  --only-light: block;
+  color-scheme: light;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-hover: var(--hover);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-fg: var(--fg);
+  --color-fg-2: var(--fg-2);
+  --color-muted: var(--muted);
+  --color-subtle: var(--subtle);
+  --color-faint: var(--faint);
+  --color-inverse: var(--inverse);
+  --color-danger: var(--danger);
+  --color-danger-dim: var(--danger-dim);
+  --color-warn: var(--warn);
+  --color-warn-dim: var(--warn-dim);
+  --color-ok: var(--ok);
+  --color-ok-dim: var(--ok-dim);
+  --color-info: var(--info);
+  --color-info-dim: var(--info-dim);
+  --color-accent: var(--accent);
+  --color-accent-dim: var(--accent-dim);
+  --color-overlay: var(--overlay);
+  --color-shade: var(--shade);
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --animate-fade-in: fade-in 160ms ease-out;
+  --animate-slide-in: slide-in 200ms cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-pop: pop 140ms ease-out;
+  --animate-sheet-up: sheet-up 220ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes slide-in {
+  from { transform: translateX(16px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes sheet-up {
+  from { transform: translateY(24px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+@keyframes pop {
+  from { transform: scale(0.98); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--fg);
+}
+
+/* Theme switches cross-fade instead of flashing. Only active while the switch is in progress. */
+html.theme-transition, html.theme-transition * {
+  transition: background-color 220ms ease, border-color 220ms ease, color 220ms ease, fill 220ms ease !important;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans);
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-size: 13px;
+  line-height: 1.5;
 }
+
+/* Headings: tight tracking, medium weight — quiet, precise, sleek. */
+h1, h2, h3, h4 {
+  letter-spacing: -0.022em;
+  font-weight: 560;
+  color: var(--fg);
+}
+
+.tnum { font-variant-numeric: tabular-nums; }
+.eyebrow {
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--subtle);
+  font-weight: 500;
+}
+
+::selection { background: var(--sel-bg); color: var(--sel-fg); }
+
+*:focus-visible {
+  outline: 1.5px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Thin, unobtrusive scrollbars */
+* { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+input[type="date"]::-webkit-calendar-picker-indicator,
+input[type="datetime-local"]::-webkit-calendar-picker-indicator { filter: var(--picker-filter); opacity: 0.6; }
+
+/* Subtle grid backdrop used on auth screens */
+.grid-backdrop {
+  background-image:
+    linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+/* Recharts: keep tooltips and axes on-system */
+.recharts-cartesian-axis-tick-value { fill: var(--subtle); font-size: 11px; }
+.recharts-cartesian-grid line { stroke: var(--chart-grid); }
+.recharts-tooltip-cursor { fill: var(--chart-cursor); }
+
+/* Rich-text inside the email canvas mirrors email typography (light canvas inside the dark app). */
+.email-rte p { margin: 0 0 12px; }
+.email-rte p:last-child { margin-bottom: 0; }
+.email-rte ul, .email-rte ol { margin: 0 0 12px; padding-left: 22px; }
+.email-rte ul { list-style: disc; }
+.email-rte ol { list-style: decimal; }
+.email-rte blockquote { margin: 0 0 12px; padding-left: 14px; border-left: 3px solid currentColor; opacity: .85; }
+.email-rte a { text-decoration: underline; }
+.email-rte h1 { font-size: 28px; font-weight: 600; margin: 0 0 12px; }
+.email-rte h2 { font-size: 22px; font-weight: 600; margin: 0 0 12px; }
+.email-rte h3 { font-size: 18px; font-weight: 600; margin: 0 0 12px; }
+.email-rte p.is-editor-empty:first-child::before { content: attr(data-placeholder); color: #a1a1aa; float: left; height: 0; pointer-events: none; }
+.email-canvas ::selection { background: #0a0a0a; color: #fff; }
+
+/* Canvas surfaces (workflow builder, editors) get a dotted backdrop that follows the theme. */
+.dot-canvas {
+  background-image: radial-gradient(circle at 1px 1px, var(--grid-dot) 1px, transparent 0);
+  background-size: 18px 18px;
+}
+
+/* Workflow canvas (React Flow) on the design tokens. */
+.workflow-canvas {
+  --xy-background-color: transparent;
+  --xy-node-boxshadow-selected: none;
+  --xy-edge-stroke: var(--faint);
+  --xy-connectionline-stroke: var(--fg);
+  --xy-handle-background-color: var(--muted);
+  --xy-handle-border-color: var(--surface);
+  --xy-selection-background-color: color-mix(in srgb, var(--fg) 5%, transparent);
+  --xy-selection-border: 1px dashed var(--faint);
+  --xy-minimap-background-color: var(--surface);
+  --xy-controls-button-background-color: var(--surface);
+  --xy-controls-button-background-color-hover: var(--surface-3);
+  --xy-controls-button-color: var(--muted);
+  --xy-controls-button-color-hover: var(--fg);
+  --xy-controls-button-border-color: var(--border);
+  --xy-controls-box-shadow: var(--raised-shadow);
+}
+.workflow-canvas .react-flow__controls { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.workflow-canvas .react-flow__minimap { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; box-shadow: var(--raised-shadow); }
+.workflow-canvas .react-flow__node { cursor: grab; }
+.workflow-canvas .react-flow__node.dragging { cursor: grabbing; }
+.workflow-canvas .react-flow__handle.connectingto, .workflow-canvas .react-flow__handle.valid { background: var(--fg); }
+
+/* Printing an invoice: only the invoice sheet is printed. */
+@media print {
+  body * { visibility: hidden; }
+  .print-area, .print-area * { visibility: visible; }
+  .print-area { position: absolute; inset: 0 auto auto 0; width: 100%; border: 0; }
+}
+
+/* Landing pages (onboarding homepage): scroll-driven reveal where supported; content is visible everywhere else. */
+@keyframes home-reveal {
+  from { opacity: 0; transform: translateY(18px); }
+  to { opacity: 1; transform: none; }
+}
+@supports (animation-timeline: view()) {
+  .home-reveal { animation: home-reveal linear both; animation-timeline: view(); animation-range: entry 0% cover 22%; }
+}
+.home-marquee { display: flex; width: max-content; animation: home-marquee 40s linear infinite; }
+.home-marquee:hover { animation-play-state: paused; }
+@keyframes home-marquee { to { transform: translateX(-50%); } }
+.home-faq summary::-webkit-details-marker { display: none; }
+.home-faq details[open] .home-faq-icon { transform: rotate(45deg); }
+/* Lead Finder homepage: slow-drifting aurora and typing dots. */
+@keyframes home-float {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+  33% { transform: translate3d(6%, -4%, 0) scale(1.08); }
+  66% { transform: translate3d(-5%, 5%, 0) scale(0.95); }
+}
+.home-aurora { animation: home-float 22s ease-in-out infinite; will-change: transform; }
+@keyframes home-dot { 0%, 80%, 100% { opacity: .25; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-3px); } }
+.home-typing span { animation: home-dot 1.2s infinite ease-in-out; }
+.home-typing span:nth-child(2) { animation-delay: .15s; }
+.home-typing span:nth-child(3) { animation-delay: .3s; }
+
+/*
+ * Phones (< 640px). Every data table (one with a <thead>) becomes a stack of cards: each row is a
+ * card and each cell shows its column header as a label (labels are filled in by <ResponsiveTables/>).
+ * The first labelled cell is the card title and a lone selection checkbox sits in the top-right
+ * corner. Opt a table out with `.table-keep`; email canvases are excluded.
+ */
+@media (max-width: 639.98px) {
+  table:has(> thead):not(.table-keep, .email-canvas table, .email-rte table) {
+    display: block; width: 100% !important; min-width: 0 !important; border: 0;
+  }
+  table:has(> thead):not(.table-keep, .email-canvas table, .email-rte table) > thead { display: none; }
+  table:has(> thead):not(.table-keep, .email-canvas table, .email-rte table) > :is(tbody, tfoot) {
+    display: flex; flex-direction: column; gap: 8px; padding: 8px;
+  }
+  table:has(> thead):not(.table-keep, .email-canvas table, .email-rte table) > :is(tbody, tfoot) > tr {
+    position: relative; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 14px; row-gap: 8px;
+    border: 1px solid var(--border) !important; border-radius: 10px; background: var(--surface); padding: 10px 12px;
+    height: auto !important;
+  }
+  table:has(> thead):not(.table-keep, .email-canvas table, .email-rte table) > :is(tbody, tfoot) > tr > :is(td, th) {
+    display: flex; flex-direction: column; align-items: flex-start; justify-content: flex-start; gap: 2px;
+    width: auto !important; max-width: none !important; min-width: 0; height: auto !important; min-height: 0;
+    padding: 0 !important; white-space: normal !important; text-align: left !important; border: 0 !important;
+    overflow-wrap: anywhere;
+  }
+  table:has(> thead) td[data-label]:not([data-label=""])::before {
+    content: attr(data-label); font-size: 10px; line-height: 1.4; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--subtle); font-weight: 500; overflow-wrap: normal;
+  }
+  /* Card title spans the card */
+  table:has(> thead) td[data-primary] { grid-column: 1 / -1; font-weight: 500; font-size: 13.5px; padding-right: 28px !important; }
+  table:has(> thead) td[data-primary]::before { display: none; }
+  /* Unlabelled cells (actions) span the card, aligned to the end */
+  table:has(> thead) td:is(:not([data-label]), [data-label=""]):not([data-primary], [data-select]) {
+    grid-column: 1 / -1; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: flex-end;
+  }
+  table:has(> thead) td:is(:not([data-label]), [data-label=""]):not([data-primary], [data-select]):empty { display: none; }
+  /* Selection checkbox in the corner */
+  table:has(> thead) td[data-select] { position: absolute !important; top: 11px; right: 12px; }
+  /* Full-width cells (empty / error states, expanders) */
+  table:has(> thead) td[colspan] { grid-column: 1 / -1; display: block; }
+  table:has(> thead) tr:has(> td[colspan]:only-child) { display: block; padding: 0; }
+  table:has(> thead) td > * { max-width: 100%; }
+
+  /* Wide-table containers no longer need to scroll sideways */
+  .overflow-x-auto:has(> table:not(.table-keep)) { overflow-x: visible; }
+
+  /* Single-column grids: let the column shrink instead of growing to fit long unbreakable text */
+  .grid:not([class*="grid-cols-"], [class*="grid-flow-col"], [style*="grid-template-columns"]) { grid-template-columns: minmax(0, 1fr); }
+
+  /* iOS zooms into inputs smaller than 16px */
+  input:not([type="checkbox"], [type="radio"], [type="color"], [type="range"]), select, textarea { font-size: 16px !important; max-width: 100%; }
+}
+
+/* Form controls in flex/grid rows may shrink below their intrinsic width (avoids sideways overflow on phones). */
+input, select, textarea { min-width: 0; }
+
+/* Horizontal scroller without a visible bar (tab strips, chip rows) */
+.scrollbar-none { scrollbar-width: none; }
+.scrollbar-none::-webkit-scrollbar { display: none; }
+
+/* Touch screens have no hover: show controls that are otherwise revealed on hover, and let drag handles drag. */
+@media (hover: none) {
+  :is([class*="group-hover"], [class*="hover:opacity-100"])[class*="opacity-0"]:not([aria-hidden="true"]) { opacity: 1 !important; }
+}
+[aria-label="Drag to reorder"] { touch-action: none; }

@@ -39,3 +39,14 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# app
+/storage
+.env
+.env.local
+/backups
+!.env.example
+/storage-test
+/.logs
+/docs/openapi.json.bak
+/backups

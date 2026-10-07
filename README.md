@@ -1,36 +1,27 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# markeetor.com
 
-## Getting Started
+Secure, multi-tenant lead distribution and CRM platform.
 
-First, run the development server:
+- **Platform portal** (`/admin`): import, validate and de-duplicate leads; distribute them to client
+  organizations (10 strategies, quotas, scheduling, rollback, automated rules); manage clients,
+  users, roles and approvals; analytics, security center, tamper-evident audit log, automation.
+- **Client workspace** (`/app`): tenant-isolated CRM — leads, pipeline (Kanban), tasks and calendar,
+  communication and consent logging, team management, analytics, workspace settings.
+  Contact details are masked by default; there is no lead export.
+
+Stack: Next.js 16 · React 19 · TypeScript · Tailwind 4 · PostgreSQL 16 (Prisma, row-level security) ·
+Redis + BullMQ · Vitest.
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+APP_DB_PASSWORD=... BACKUP_DB_PASSWORD=... npm run db:setup   # or: docker compose up -d postgres redis
+cp .env.example .env && $EDITOR .env
+npm run db:migrate && npm run db:seed
+npm run dev        # web
+npm run worker     # background jobs (separate terminal)
+npm test           # 65 unit, integration and security tests
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+See **[DEVELOPMENT.md](DEVELOPMENT.md)** for architecture, the security model, demo accounts,
+module status, verification performed, operations and known limitations.
+API reference: `docs/openapi.json` (served at `/api/v1/openapi.json` to platform users).
