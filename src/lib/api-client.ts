@@ -15,6 +15,22 @@ export function registerStepUpHandler(fn: StepUpHandler | null) {
 type Opts = { method?: string; body?: unknown; signal?: AbortSignal; raw?: boolean };
 
 /**
+ * Hard-navigates to a recovery page, unless we are already on it.
+ *
+ * The guard is what stops a reload loop: pages such as /account/mfa-setup still render the
+ * app shell, whose notification poll calls an `auth: 'required'` endpoint. For a user who has
+ * not enrolled yet that returns MFA_ENROLLMENT_REQUIRED, and redirecting to the page we are
+ * already on would reload it, re-poll, and redirect again — forever, with the page visibly
+ * flickering and any in-flight request (the enrollment QR) aborted before it can render.
+ */
+function navigate(to: string) {
+  if (typeof window === 'undefined') return;
+  const target = new URL(to, window.location.origin);
+  if (target.pathname === window.location.pathname) return;
+  window.location.href = to;
+}
+
+/**
  * Same-origin JSON fetch. On STEP_UP_REQUIRED it asks the global step-up dialog to re-verify the user,
  * then retries once. On session expiry it sends the user back to sign in.
  */
@@ -41,11 +57,11 @@ export async function api<T = unknown>(path: string, opts: Opts = {}, retried = 
   if (e.code === 'STEP_UP_REQUIRED' && !retried && stepUpHandler) {
     if (await stepUpHandler()) return api<T>(path, opts, true);
   }
-  if (e.code === 'UNAUTHENTICATED' && typeof window !== 'undefined' && !path.includes('/auth/')) {
-    window.location.href = `/login?next=${encodeURIComponent(window.location.pathname)}`;
+  if (e.code === 'UNAUTHENTICATED' && !path.includes('/auth/')) {
+    navigate(`/login?next=${encodeURIComponent(typeof window === 'undefined' ? '/' : window.location.pathname)}`);
   }
-  if (e.code === 'MFA_ENROLLMENT_REQUIRED' && typeof window !== 'undefined') window.location.href = '/account/mfa-setup';
-  if (e.code === 'PASSWORD_CHANGE_REQUIRED' && typeof window !== 'undefined') window.location.href = '/account/change-password';
+  if (e.code === 'MFA_ENROLLMENT_REQUIRED') navigate('/account/mfa-setup');
+  if (e.code === 'PASSWORD_CHANGE_REQUIRED') navigate('/account/change-password');
   throw new ApiError(res.status, e.code, e.message, e.details, e.requestId);
 }
 

@@ -25,13 +25,19 @@ export type ShellProps = {
   showBrandText?: boolean;
   allowThemeChoice?: boolean;
   user: { name: string; email: string; mfaEnabled: boolean };
+  /**
+   * The account is blocked on a mandatory step (MFA enrollment, forced password change).
+   * Search and notifications call `auth: 'required'` endpoints that will refuse the request
+   * until it is done, so they are hidden rather than left to fail on a timer.
+   */
+  restricted?: boolean;
   roleName: string;
   searchPlaceholder: string;
   watermark?: string | null;
   children: React.ReactNode;
 };
 
-export function AppShell({ nav, home, brand, sub, mark, showBrandText = true, allowThemeChoice = true, user, roleName, searchPlaceholder, watermark, children }: ShellProps) {
+export function AppShell({ nav, home, brand, sub, mark, showBrandText = true, allowThemeChoice = true, user, roleName, searchPlaceholder, watermark, restricted = false, children }: ShellProps) {
   const [open, setOpen] = useState(false);
   const close = useCallback(() => setOpen(false), []);
   const theme = useResolvedTheme();
@@ -47,9 +53,9 @@ export function AppShell({ nav, home, brand, sub, mark, showBrandText = true, al
       <div className="lg:pl-[232px]">
         <header className="sticky top-0 z-30 flex h-14 items-center gap-2 border-b border-border bg-bg/85 px-3 pt-[env(safe-area-inset-top)] backdrop-blur-md sm:gap-3 sm:px-4 md:px-6 [@supports(padding:env(safe-area-inset-top))]:h-[calc(3.5rem+env(safe-area-inset-top))]">
           <button className="-ml-1 grid size-9 shrink-0 place-items-center rounded-md text-muted hover:text-fg lg:hidden" onClick={() => setOpen(true)} aria-label="Open navigation"><MenuIcon className="size-[18px]" /></button>
-          <div className="flex min-w-0 flex-1 items-center"><GlobalSearch placeholder={searchPlaceholder} /></div>
+          <div className="flex min-w-0 flex-1 items-center">{!restricted && <GlobalSearch placeholder={searchPlaceholder} />}</div>
           <div className="flex shrink-0 items-center gap-0.5 sm:gap-1">
-            <Notifications />
+            {!restricted && <Notifications />}
             <Menu>
               <MenuTrigger asChild>
                 <button className="ml-1 flex items-center gap-2 rounded-md py-1 pr-1 pl-1 hover:bg-surface-3" aria-label="Account menu">

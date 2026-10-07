@@ -27,6 +27,7 @@ export default async function AccountLayout({ children }: LayoutProps<'/account'
       showBrandText={!platform || !mark.logoUrl || mark.showNameWithLogo}
       allowThemeChoice={allowThemeChoice}
       user={{ name: ctx.user.name, email: ctx.user.email, mfaEnabled: ctx.user.mfaEnabled }}
+      restricted={Boolean(ctx.restriction)}
       roleName={ctx.role.name}
       searchPlaceholder={platform ? 'Search leads, organizations, users…' : 'Search your leads…'}
     >
