@@ -168,14 +168,19 @@ async function registerSchedules() {
   await upsertSchedule('endpoint-purge', { queue: 'email', name: 'endpoint-purge', cron: '41 3 * * *' });
 }
 
-/** Repeats `fn` every `everyMs` until shutdown, logging rather than throwing. */
+/**
+ * Repeats `fn` every `everyMs` until shutdown, logging rather than throwing.
+ *
+ * The timers are deliberately NOT unref'd: they are the only thing keeping the event loop
+ * alive between jobs. Unref'ing them lets node exit as soon as the queue goes idle, which
+ * looks like the worker crash-looping under a supervisor — it starts, drains what is due,
+ * exits cleanly, and gets restarted.
+ */
 function every(everyMs: number, label: string, fn: () => Promise<unknown>) {
-  const timer = setInterval(() => {
+  return setInterval(() => {
     if (shuttingDown) return;
     void fn().catch((err) => logger.error({ err, task: label }, 'worker task failed'));
   }, everyMs);
-  timer.unref?.();
-  return timer;
 }
 
 async function main() {
